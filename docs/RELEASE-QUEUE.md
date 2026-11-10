@@ -17,6 +17,31 @@
 > **2026-11-03 04:05：v0.8.7 已发布**，覆盖本表截至该时间的全部待发布批次（0.8.6 以来全部 dev，74 commits）。
 > 以下批次保留作追溯；后续新批次继续加在最上面。
 
+### 批次 2026-11-11 01:45 · QQ 承诺定时（模糊：晚点/稍后）
+
+<!-- release-batch: start=2026-11-11T01:20+08:00 end=2026-11-11T01:45+08:00 commits=feat/promise-noshow -->
+
+**覆盖提交**：`feat/promise-noshow`（在反向承诺之上叠加）
+**建议**：随前两批一起发 **0.9.1（patch）**
+
+**改了什么**：
+- `src/promise-time.mjs`：新增 `detectVaguePromise` / `computeVagueFireAt` / `VAGUE_CUE_RE`。
+- `src/bridge.js`：
+  - promise 增加 `kind`：`exact`（有钟点）/ `vague`（「晚点/稍后」）；
+  - `vague` 无 `forAt`，触发点 = `createdAt + [1h, 2h]` 随机，且要求 `lastIncomingAt <= createdAt`
+    （期间没再聊）才真的开口，否则记 `active`（聊上了，不用打扰）；
+  - 出站/入站扫描在没有具体钟点时回落到模糊识别；
+  - 新增【接上】/【没等到】两条提示词分支，`TIMER_WAKE_REASONS` / `autoWake` 加 `vague`；
+  - `/api/socialV2/promise` 与 `qq_set_promise` 支持 `vague: true`（不用传 time）。
+- `config.example.json`：`promise` 增加 `vagueMinMs` / `vagueMaxMs`。
+- `scripts/test-qq-promise.mjs`：+6 例（模糊识别、窗口、没聊→开口、聊过→不打扰、两方向入口）。
+
+**case**：`docs/cases/2026-11-11-qq-promise.md`（新增「第三种：模糊承诺」）
+
+**验证**：`node scripts/test-qq-promise.mjs` → 25/25。
+
+**回滚**：`socialV2.promise.enabled = false` 并重启桥接。
+
 ### 批次 2026-11-11 01:30 · QQ 承诺定时（反向：等不到人就问）
 
 <!-- release-batch: start=2026-11-11T01:00+08:00 end=2026-11-11T01:30+08:00 commits=feat/promise-noshow -->

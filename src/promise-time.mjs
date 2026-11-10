@@ -27,6 +27,10 @@ const CUE_RE = /(约好|说好|答应|来找你|去找你|来找我|跟你聊|�
 // 必须带第一人称 + 明确的「过去」动作 —— 否则「我去睡了」这种也会中招。
 const INCOMING_CUE_RE = /((我|咱)[^。！？\n]{0,12}(来找你|来见你|过来|到你那|到你家|准时到|我到了|见你|等你)|等我|我(马上|这就|立刻|准时就))/;
 
+// 模糊承诺（没有具体时间）：「晚点找你」「稍后再聊」「待会儿说」「等下回你」。
+// 必须跟一个「联系你」的动词，否则「早点睡」「一会儿就凉了」全都会中。
+const VAGUE_CUE_RE = /(晚点|稍后|待会儿|待会|一会儿|一会|等会儿|等会|等下|马上)[^。！？\n]{0,10}(找你|来找|聊|说|回你|联系|过来|来|见|理你)/;
+
 // 明显的过去/习惯叙述，一律不登记。
 const PAST_RE = /(昨天|昨晚|前天|刚才|已经|早就|上个|上一次|平时|每天|以前)/;
 
@@ -148,6 +152,34 @@ export function computeAskFireAt(forAt, missMs, askWindowMs, rand = Math.random)
   const start = Number(forAt) + miss;
   const r = Math.min(0.999999, Math.max(0, Number(rand()) || 0));
   return start + Math.floor(r * win);
+}
+
+/**
+ * 模糊承诺：「晚点找你」「稍后再聊」「等下说」——没有具体钟点，只有一个「等会儿」的意思。
+ * 两个方向共用一套词表，区别只在方向标记：
+ *   direction='out' 她自己说的（晚点去找对方）
+ *   direction='in'  对方说的（晚点回来）
+ * 刻意排除带具体钟点的句子：那种走精确承诺，不该被这条规则按「1~2 小时」处理。
+ */
+export function detectVaguePromise(text, direction) {
+  const s = String(text ?? '').trim();
+  if (!s || s.length > 400) return null;
+  if (!VAGUE_CUE_RE.test(s)) return null;
+  if (PAST_RE.test(s)) return null;
+  // 已经说了具体几点，就交给 detectPromise / detectIncomingPromise，别在这里降级成模糊。
+  if (parseClockTime(s)) return null;
+  return { direction: direction === 'in' ? 'in' : 'out', raw: s.slice(0, 200) };
+}
+
+/**
+ * 在 [createdAt + minMs, createdAt + maxMs] 里随机取一个触发点。
+ * 例如「晚点」= 1~2 小时：说这句话起 1 小时后，到 2 小时前，随机挑一刻。
+ */
+export function computeVagueFireAt(createdAt, minMs, maxMs, rand = Math.random) {
+  const lo = Math.max(0, Number(minMs) || 0);
+  const hi = Math.max(lo, Number(maxMs) || 0);
+  const r = Math.min(0.999999, Math.max(0, Number(rand()) || 0));
+  return Number(createdAt) + lo + Math.floor(r * (hi - lo));
 }
 
 /** 'HH:MM'（给工具登记用；跨天由 forAt 自己表达）。 */

@@ -4,7 +4,7 @@
 // 所以这里把中文时间表达逐个钉死，再验调度/去重/错过/取消。
 import assert from 'node:assert/strict';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
-import { computeAskFireAt, computePromiseFireAt, detectIncomingPromise, detectPromise, parseChineseNumber, parseClockTime, parseHHMM } from '../src/promise-time.mjs';
+import { computeAskFireAt, computePromiseFireAt, computeVagueFireAt, detectIncomingPromise, detectPromise, detectVaguePromise, parseChineseNumber, parseClockTime, parseHHMM } from '../src/promise-time.mjs';
 
 let failures = 0;
 async function test(name, run) {
@@ -265,6 +265,81 @@ await test('入站扫描：他自己说了「我 11 点半来找你」就登记'
     // 她自己的发言走另一个入口，不该被这个钩子重复登记
     h.notePromiseFromIncoming(KEY, { text: '我今晚十一点半来找你', plain: '我今晚十一点半来找你', isSelf: true, time: Date.now() });
     assert.equal(h.promisesOf(st).length, 1);
+  } finally { h.dispose?.(); }
+});
+
+// ── 模糊承诺：「晚点/稍后」按 1~2 小时窗口 ─────────────────────────────────
+await test('detectVaguePromise：认得出「晚点找你」「稍后再聊」', () => {
+  assert.ok(detectVaguePromise('我先去忙，晚点找你', 'out'), '晚点找你');
+  assert.ok(detectVaguePromise('稍后再聊', 'in'), '稍后再聊');
+  assert.ok(detectVaguePromise('待会儿说', 'out'), '待会儿说');
+  assert.equal(detectVaguePromise('我先去忙，晚点找你', 'in').direction, 'in');
+});
+
+await test('detectVaguePromise：有具体钟点就不算模糊；没有联系动作也不算', () => {
+  assert.equal(detectVaguePromise('晚点十一点半来找你', 'out'), null, '说了几点就走精确承诺');
+  assert.equal(detectVaguePromise('早点睡', 'out'), null, '不是承诺');
+  assert.equal(detectVaguePromise('一会儿就凉了', 'out'), null, '没有联系动作');
+  assert.equal(detectVaguePromise('昨天我晚点找你', 'out'), null, '过去的事');
+});
+
+await test('computeVagueFireAt：落在 [created+1h, created+2h]', () => {
+  const created = 1_700_000_000_000;
+  const lo = 60 * 60 * 1000;
+  const hi = 2 * 60 * 60 * 1000;
+  assert.equal(computeVagueFireAt(created, lo, hi, () => 0), created + lo, 'rand=0 → 1 小时');
+  const high = computeVagueFireAt(created, lo, hi, () => 0.999999);
+  assert.ok(high > created + lo && high < created + hi, '落在 1~2 小时之间');
+});
+
+await test('模糊承诺：期间没聊天 → 到窗口主动开口', async () => {
+  const h = await bridgeHarness({ config: { socialV2: { enabled: true } } });
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State(KEY);
+    const res = h.registerPromiseV2(KEY, { text: '我先去忙，晚点找你', source: 'tool', direction: 'out', kind: 'vague' });
+    assert.equal(res.promise.kind, 'vague');
+    assert.equal(res.promise.forAt, null, '模糊承诺没有具体时刻');
+    res.promise.createdAt = Date.now() - 90 * 60_000;
+    res.promise.fireAt = Date.now() - 1000;
+    st.lastIncomingAt = Date.now() - 120 * 60_000; // 早于登记
+    const before = h.calls.created.length;
+    h.runPromiseTick();
+    const started = Date.now();
+    while (h.calls.created.length === before && Date.now() - started < 2000) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(h.calls.created.length > before, '期间没人说话就该主动开口');
+    assert.equal(h.getSocialV2State(KEY).lastWakeReason, `vague:${res.promise.id}`);
+  } finally { h.dispose?.(); }
+});
+
+await test('模糊承诺：期间聊过了 → 不打扰', async () => {
+  const h = await bridgeHarness({ config: { socialV2: { enabled: true } } });
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State(KEY);
+    const res = h.registerPromiseV2(KEY, { text: '我先去忙，晚点找你', source: 'tool', direction: 'out', kind: 'vague' });
+    res.promise.createdAt = Date.now() - 90 * 60_000;
+    res.promise.fireAt = Date.now() - 1000;
+    st.lastIncomingAt = Date.now() - 30 * 60_000; // 晚于登记 → 聊过了
+    const before = h.calls.created.length;
+    h.runPromiseTick();
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(h.calls.created.length, before, '聊过了就不该再主动');
+    assert.equal(res.promise.status, 'active', '要记成「期间又聊上了」而不是静默跳过');
+  } finally { h.dispose?.(); }
+});
+
+await test('模糊承诺两个入口：她说的走 out，他说的走 in', async () => {
+  const h = await bridgeHarness({ config: { socialV2: { enabled: true } } });
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State(KEY);
+    h.notePromiseFromOutbound(KEY, ['我先去忙，晚点找你']);
+    h.notePromiseFromIncoming(KEY, { text: '我晚点回来找你', plain: '我晚点回来找你', isSelf: false, isOwner: true, time: Date.now() });
+    const list = h.promisesOf(st);
+    assert.equal(list.length, 2, '两个方向各登记一条');
+    // 用字符串比：数组来自 vm 夹具的另一个 realm，deepEqual 会因为原型不同而假失败。
+    assert.equal(list.map((p) => `${p.direction}:${p.kind}`).sort().join(','), 'in:vague,out:vague');
   } finally { h.dispose?.(); }
 });
 
