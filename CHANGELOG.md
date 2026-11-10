@@ -1,3 +1,22 @@
+## [0.9.1] - 2026-11-10
+
+### 修复
+
+- **一键启动拉不起 SnowLuma**：插件宿主是 Electron，`process.execPath` 指向 `DeepSeek Harness.exe` 而不是 node，
+  拿它去跑 `index.mjs` 会静默失败。新增 `resolveSnowLumaNode()`：优先用 SnowLuma 自带的 `node.exe`，
+  其次 `snowluma.nodePath`，宿主本身是 node 时才用 `execPath`，都拿不到就回落 `launcher.bat`。
+- **启动时弹「你要打开此文件吗」**：隐藏黑框模式下生成的 `state/snowluma-launch.vbs` 原来用 `explorer.exe` 打开，
+  Windows 会拦脚本。改为由 `wscript.exe` 直接执行，不再弹确认框。
+- **SnowLuma 黑框（`D:\SnowLuma\node.exe`）**：用 `windowsHide` 创建的父进程没有控制台，
+  它自己再 spawn 子进程时 Windows 会给子进程分配一个**可见**的新控制台。改为 VBS 的 `window style 0`
+  提供一个隐藏但存在的控制台，子进程继承它，不再开窗。
+- `nodePathEnv()` 不再把 `dirname(process.execPath)`（Electron 目录）塞进 PATH。
+
+### 说明
+
+- 上游 0.8.9 起 DSH 宿主是 Electron，凡是「拿 `process.execPath` 当 node」的地方都会静默失败；
+  `test-launch-components` 已加静态断言钉住这个坑。
+
 ## [0.9.0] - 2026-11-10
 
 ### 新增
