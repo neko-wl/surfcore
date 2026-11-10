@@ -819,13 +819,14 @@ server.tool(
     time: z.string().optional().describe('约定时刻，24 小时制 HH:MM，例如 23:30'),
     text: z.string().optional().describe('当时说的原话或由头（会被带进赴约那次唤醒，最多 200 字）'),
     cancel: z.boolean().optional().describe('true = 取消这条约定（默认取消最近一条待赴约的；配合 id 精确取消）'),
-    id: z.string().optional().describe('要取消的约定 id（cancel=true 时可选）')
+    id: z.string().optional().describe('要取消的约定 id（cancel=true 时可选）'),
+    direction: z.enum(['out', 'in']).optional().describe('out=你答应去找对方（默认，提前量内主动来）；in=对方答应来找你（过了约定点还没人来，你主动问一句）')
   },
-  async ({ key, token, time, text, cancel, id }) => {
+  async ({ key, token, time, text, cancel, id, direction }) => {
     try {
       const data = await agentApi('/api/socialV2/promise', {
         method: 'POST',
-        body: JSON.stringify({ key, time, text, cancel, id }),
+        body: JSON.stringify({ key, time, text, cancel, id, direction }),
         headers: { 'x-agent-token': token }
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };

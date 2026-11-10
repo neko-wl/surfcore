@@ -227,7 +227,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 目的机制：测试可只读预览 / 手动触发 / 模拟回合回执（不连真 QQ）。
     runPurpose, purposeState, notePurposeTurnEnded, notePurposeOutbound, startPurposeLoop, warmPurposeState,
     // 承诺定时（promise）：登记 / 出站扫描 / 到点赴约 / 取消。
-    registerPromiseV2, runPromiseTick, notePromiseFromOutbound, cancelPromiseV2, promisesOf,
+    registerPromiseV2, runPromiseTick, notePromiseFromOutbound, notePromiseFromIncoming, cancelPromiseV2, promisesOf,
     // 对话收尾判断：测试可直接调内部函数（不连真 QQ）。
     closeConversationV2, assessClosureV2, closureConfigV2, closureSuppressesWake, noteClosureReopenV2,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator, synthesizeVoiceText,

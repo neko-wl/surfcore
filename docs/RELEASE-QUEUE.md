@@ -17,6 +17,33 @@
 > **2026-11-03 04:05：v0.8.7 已发布**，覆盖本表截至该时间的全部待发布批次（0.8.6 以来全部 dev，74 commits）。
 > 以下批次保留作追溯；后续新批次继续加在最上面。
 
+### 批次 2026-11-11 01:30 · QQ 承诺定时（反向：等不到人就问）
+
+<!-- release-batch: start=2026-11-11T01:00+08:00 end=2026-11-11T01:30+08:00 commits=feat/promise-noshow -->
+
+**覆盖提交**：`feat/promise-noshow`（在 promise 那批之上叠加）
+**建议**：随上一批一起发 **0.9.1（patch）**
+
+**改了什么**：
+- `src/promise-time.mjs`：新增 `detectIncomingPromise`、`computeAskFireAt`、`INCOMING_CUE_RE`；
+  把「几点 → 具体时刻」的 12/24 小时制换算抽成 `resolveForAt`，两个方向共用。
+- `src/bridge.js`：
+  - `registerPromiseV2` 支持 `direction`（`out` = 她要来，`in` = 他要来），两个方向各自算触发点；
+  - `runPromiseTick` 按方向分支：`in` 到点后查 `lastIncomingAt` 判断人来没来，
+    没来 → `noshow:<id>` 追问，来了 → `kept`（留痕，不静默跳过）；
+  - `appendSocialV2Message` 挂入站扫描 `notePromiseFromIncoming`（群里只认主人）；
+  - 新增【没等到人】提示词分支；`TIMER_WAKE_REASONS` / `autoWake` 加 `noshow`；
+  - `POST /api/socialV2/promise` 与 `qq_set_promise` 支持 `direction`。
+- `config.example.json`：`promise` 增加 `missMs` / `askWindowMs` / `noshowGraceMs`。
+- `scripts/test-qq-promise.mjs`：+6 例（入站识别、追问窗口、等不到人、人来了、入站扫描）。
+
+**case**：`docs/cases/2026-11-11-qq-promise.md`（新增「反向」一节）
+
+**验证**：`node scripts/test-qq-promise.mjs` → 19/19；`test-audit-regressions` 全过；
+`test-audit` 143/144（唯一失败仍是 `test-audit-setup` 的 cpSync 环境问题）。
+
+**回滚**：`socialV2.promise.enabled = false` 并重启桥接。
+
 ### 批次 2026-11-11 01:05 · QQ 承诺定时（她说了几点就按时来）
 
 <!-- release-batch: start=2026-11-11T00:10+08:00 end=2026-11-11T01:05+08:00 commits=feat/proactive-timer -->
