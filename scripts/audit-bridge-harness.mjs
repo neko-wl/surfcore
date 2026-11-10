@@ -51,6 +51,7 @@ import * as purposeEngine from '../src/purpose-engine.js';
 import * as conversationClosure from '../src/conversation-closure.js';
 import { fetchVideoInfo } from '../src/bili-api.js';
 import * as stateAcl from '../src/state-acl.mjs';
+import * as scheduledProactive from '../src/scheduled-proactive.mjs';
 import * as qqAt from '../src/qq-at.js';
 import * as modelOptions from '../src/model-options.js';
 import { createBiliMemory } from '../src/bili-memory.js';
@@ -225,6 +226,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     runHistoryCatchUp, historyCatchUpConfig, appendHistoryCatchupV2, fetchOneBotHistory,
     // 目的机制：测试可只读预览 / 手动触发 / 模拟回合回执（不连真 QQ）。
     runPurpose, purposeState, notePurposeTurnEnded, notePurposeOutbound, startPurposeLoop, warmPurposeState,
+    // 定点主动（scheduledProactive）：手动跑一拍，断言「到点必发」与去重/错过分支。
+    runScheduledProactiveTick, scheduledProactiveItems, startScheduledProactiveLoop,
     // 对话收尾判断：测试可直接调内部函数（不连真 QQ）。
     closeConversationV2, assessClosureV2, closureConfigV2, closureSuppressesWake, noteClosureReopenV2,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator, synthesizeVoiceText,
@@ -257,7 +260,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     probeDshBaseUrl: async () => true,
     discoverDshBaseUrl: async () => null,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...selfIdentity, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...fishGuard, ...tokenGuard,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...scheduledProactive, ...presetPrompt, ...fishGuard, ...tokenGuard,
     ...qqAt,
     ...modelOptions,
     ...dshModelFollow,

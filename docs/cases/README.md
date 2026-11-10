@@ -6,6 +6,7 @@
 
 | 日期 | 案例 | 一句话 | 版本 |
 | --- | --- | --- | --- |
+| 2026-11-10 | [QQ 定点主动（到点必发）](2026-11-10-qq-scheduled-proactive.md) | 聊天里的承诺不是定时器；新增 scheduledProactive 到点必发 | 待发布 |
 | 2026-11-10 | [QQ 表情接进收藏表情](2026-11-10-qq-meme-favorites.md) | send_custom_face 表情呈现；图库检索 + emoji_id 缓存；失败回退发图 | 待发布 |
 | 2026-11-09 | [QQ 点歌链路](2026-11-09-voice-sing-qq.md) | 点歌/清唱/完整版/FLAC 音源/显存保护 | 待发布 |
 | 2026-11-03 | [人格语气层重复/未进目的提示词](2026-11-03-persona-tone-dedup.md) | tone 不再回退 core；相同内容去重；purpose 接语气层 | 待发布 |

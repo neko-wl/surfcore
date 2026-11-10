@@ -10,6 +10,7 @@ import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { normalizeScheduledItems, scheduledDayKey, scheduledDueState } from './scheduled-proactive.mjs';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
@@ -978,6 +979,14 @@ function loadConfig() {
       autoReplyCheckMs: 30000,
       agentPreset: 'qq-chat-v2',
       provideRecommendations: true,
+      // 定点主动：到点必发（不掷概率、不吃夜间折扣、不受收尾冷却影响）。
+      // 背景：主动机会是 30~90 分钟随机 + 概率判定，AI 在聊天里承诺「23:30 查岗」时
+      // 没有任何东西把这句话变成定时器，所以到点什么都没发生（2026-11-10 用户反馈）。
+      // items: [{ id, time: 'HH:MM', keys: ['private:123'], text: '这次的由头', graceMs, enabled }]
+      scheduledProactive: {
+        enabled: true,
+        items: []
+      },
       tools: {
         getPrompt: true,
 
@@ -1844,6 +1853,9 @@ async function main() {
   let purposeStateMtime = 0;
   savePurposeState();
   let purposeTimer = null;
+  let scheduledProactiveTimer = null;
+  // 「会话还没建立」的日志去重：心跳 30 秒一次，不做去重会在补发窗口内刷几十行。
+  const scheduledSkipLogged = new Set();
   let purposeRun = null; // { runId, at, key, sessionId, planned, sentTexts, timer }
   let purposeLastLog = { at: 0, reason: '', nextFireAt: 0 };
 
@@ -3877,6 +3889,8 @@ async function main() {
         if (cfg.purpose?.enabled !== false) {
           try { startPurposeLoop(); } catch (error) { log(`[目的] 启动失败：${error?.message ?? error}`); }
         }
+        // 定点主动：到点必发（补「AI 说了 23:30 见，但没人排定时器」这个缺口）。
+        try { startScheduledProactiveLoop(); } catch (error) { log(`[定点] 启动失败：${error?.message ?? error}`); }
         if (currentMode === 'reserved2') {
           // 首次确定模式为 reserved2 后再恢复持久化的有限睡眠定时器，
           // 避免在 initial chat 模式下设置定时器导致 timeout 唤醒被模式守卫吞掉。
@@ -11434,6 +11448,9 @@ async function main() {
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           // 对话收尾记录：只存结论（收在哪 / 下次怎么接）+ 冷却时间，不存额外消息副本。
           closure: st.closure && typeof st.closure === 'object' ? st.closure : undefined,
+          // 定点主动：{ itemId: 'YYYY-MM-DD' | 'missed:YYYY-MM-DD' }，保证同一 item 每天只投递一次。
+          scheduledProactiveFired: st.scheduledProactiveFired && typeof st.scheduledProactiveFired === 'object' ? st.scheduledProactiveFired : undefined,
+          lastScheduledProactiveError: st.lastScheduledProactiveError && typeof st.lastScheduledProactiveError === 'object' ? st.lastScheduledProactiveError : undefined,
           // 鱼群保护状态（2026-10-23）：冷却、直呼放行、最近触发记录。
           fishGuard: st.fishGuard && typeof st.fishGuard === 'object' ? st.fishGuard : undefined,
           fishGuardBypass: st.fishGuardBypass && typeof st.fishGuardBypass === 'object' ? st.fishGuardBypass : undefined,
@@ -14890,6 +14907,13 @@ async function main() {
     if (reason === 'proactiveCheck') {
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
+    if (String(reason).startsWith('scheduled:')) {
+      // 定点主动：不是「恰好有空位」的随机冒泡，而是事先定好的约定，所以措辞要像赴约。
+      const itemId = String(reason).slice('scheduled:'.length);
+      const item = scheduledProactiveItems().find((it) => it.id === itemId);
+      const intent = item?.text ? `\n这次约定的由头：${item.text}` : '';
+      return `${base}【定点主动】${key}\n原因：这是事先定好要在 ${item?.time ?? '这个时间'} 主动找对方的一次约定，不是随机机会。${intent}\n按这个由头自然开口，一两句就够；就算对方没回应，也要把约好的这句话说完，不要因为冷场就放弃。`;
+    }
     if (reason === 'history') {
       return `${base}【上线补历史】${key}\n原因：你刚上线，桥接用 QQ 历史记录把离线期间错过的消息补进了未读（消息带 history=true；若本次快照没内联，可调用 qq_get_context_snapshot(include=["unread"]) 查看）。\n先快速扫一遍补上下文；这些是已经发生的旧消息，除非仍然相关，不要逐条回复或引用，也不要当成刚刚发生。看完可以用 qq_mark_read 或 qq_set_wake_config 安静收尾。`;
     }
@@ -14917,7 +14941,7 @@ async function main() {
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
     const stForGuard = getSocialV2State(key);
-    const autoWake = ['proactiveCheck', 'timeout', 'replyCheck', 'history', 'bootstrap'].includes(String(reason));
+    const autoWake = ['proactiveCheck', 'timeout', 'replyCheck', 'history', 'bootstrap', 'scheduled'].includes(String(reason).split(':')[0]);
     const channel = qqSendChannelStatus();
     if (!channel.ok) {
       if (!stForGuard.channelGateLoggedAt || Date.now() - stForGuard.channelGateLoggedAt > 10 * 60 * 1000) {
@@ -15211,7 +15235,7 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导/上线补历史）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'history', 'backlog']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'history', 'backlog', 'scheduled']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -15653,6 +15677,79 @@ async function main() {
     }, delay);
     st.proactiveTimer.unref?.();
     log(`[reserved2] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
+  }
+
+  // ── 定点主动（scheduledProactive）────────────────────────────────────────
+  // 现象：AI 在 QQ 里承诺「11:30 查岗」，到点什么都没发（2026-11-10 用户反馈）。
+  // 根因：能把消息主动推出去的只有两条路 ——「目的」受 dailyMax + 安静时段管，
+  //       「主动机会」是 30~90 分钟随机 + 概率（23 点后还要再 ×0.3）。两者都不提供
+  //       「到点必发」，而聊天里那句承诺只是一段文本，没有任何机制把它翻译成定时器。
+  // 修法：配置 socialV2.scheduledProactive.items，每条一个本地时刻；30 秒心跳检查，
+  //       同一天同一 item 只投一次，停机错过可在 graceMs 内补发。
+  // 边界：仍然吃发送通道闸 / 模式允许范围 / 唤醒暂停（这些是物理约束，不该被绕过）；
+  //       但明确不吃夜间概率折扣和收尾冷却 —— 定点的意义就是准点。
+  // 纯逻辑（配置归一化 / 日期键 / 到点判定）在 src/scheduled-proactive.mjs，那里可以单测。
+  function scheduledProactiveItems() {
+    return normalizeScheduledItems(cfg.socialV2?.scheduledProactive);
+  }
+
+  function runScheduledProactiveTick() {
+    if (cfg.socialV2?.enabled === false) return;
+    if (socialV2.paused) return;
+    const items = scheduledProactiveItems();
+    if (!items.length) return;
+    const now = Date.now();
+    const today = scheduledDayKey(now);
+    for (const item of items) {
+      const due = scheduledDueState(item, now);
+      if (!due) continue;
+      for (const key of item.keys) {
+        // 会话还不存在就不主动创建：写错 key 或对方从没聊过时，不该凭空起一个 DSH 会话烧 token。
+        // 注意必须用 has() 判断，且放在 getSocialV2State() 之前 —— 后者会顺手把会话建出来。
+        if (!socialV2.conversations.has(key)) {
+          const skipKey = `${key}|${item.id}|${today}`;
+          if (!scheduledSkipLogged.has(skipKey)) {
+            scheduledSkipLogged.add(skipKey);
+            log(`[定点] 跳过 ${key}（${item.time} ${item.id}）：该会话还没建立过，不主动创建`);
+          }
+          continue;
+        }
+        const st = getSocialV2State(key);
+        if (!st.scheduledProactiveFired || typeof st.scheduledProactiveFired !== 'object') st.scheduledProactiveFired = {};
+        const fired = String(st.scheduledProactiveFired[item.id] ?? '');
+        if (fired === today || fired === `missed:${today}`) continue;
+
+        if (due.state === 'missed') {
+          st.scheduledProactiveFired[item.id] = `missed:${today}`;
+          saveSocialV2State();
+          log(`[定点] 错过 ${key}（${item.time} ${item.id}）：已过补发窗口 ${Math.round(item.graceMs / 60000)} 分钟，今天不再补`);
+          continue;
+        }
+        // 先记账再投递：心跳 30 秒一次，投递是异步的，不先标记会被下一拍重复触发。
+        st.scheduledProactiveFired[item.id] = today;
+        saveSocialV2State();
+        log(`[定点] 到点投递 ${key}（${item.time} ${item.id}${item.text ? ` · ${item.text.slice(0, 40)}` : ''}）`);
+        appendActivity(`${key} [定点] 主动投递 ${item.id}（${item.time}）`);
+        void sendWakePromptV2(key, `scheduled:${item.id}`).catch((error) => {
+          const message = String(error?.message ?? error).slice(0, 200);
+          log(`[定点] 投递异常 ${key}（${item.id}）：${message}`);
+          try {
+            st.lastScheduledProactiveError = { at: Date.now(), key, id: item.id, error: message, hint: '检查桥接日志 [channel-gate] / 模式 / 唤醒暂停状态' };
+            saveSocialV2State();
+          } catch {}
+        });
+      }
+    }
+  }
+
+  function startScheduledProactiveLoop() {
+    if (scheduledProactiveTimer) return;
+    const items = scheduledProactiveItems();
+    scheduledProactiveTimer = setInterval(runScheduledProactiveTick, 30 * 1000);
+    scheduledProactiveTimer.unref?.();
+    log(`[定点] 已启动：${items.length} 条${items.length ? `（${items.map((i) => i.time).join(', ')}）` : '（未配置）'}；每 30 秒检查`);
+    // 启动即看一次：停机期间错过但仍在补发窗口内的，开机就补。
+    setTimeout(runScheduledProactiveTick, 3000).unref?.();
   }
 
   function clearSocialV2Timers(key) {

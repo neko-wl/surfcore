@@ -17,6 +17,41 @@
 > **2026-11-03 04:05：v0.8.7 已发布**，覆盖本表截至该时间的全部待发布批次（0.8.6 以来全部 dev，74 commits）。
 > 以下批次保留作追溯；后续新批次继续加在最上面。
 
+### 批次 2026-11-11 00:10 · QQ 定点主动（到点必发）
+
+<!-- release-batch: start=2026-11-10T23:40+08:00 end=2026-11-11T00:10+08:00 commits=feat/proactive-timer -->
+
+**覆盖提交**：`feat/proactive-timer`（未合入 dev；见下方交接块）
+**建议**：**0.9.1（patch）** —— 新增一条主动通道 + 一个配置项，默认关闭，无破坏性变更
+
+**改了什么**：
+- `src/scheduled-proactive.mjs`（新增）：`normalizeScheduledItems` / `scheduledDayKey` / `scheduledDueState` / `isValidTime`。
+- `src/bridge.js`
+  - 新增 `socialV2.scheduledProactive` 默认块（`enabled: true, items: []`）；
+  - 新增 `scheduledProactiveItems` / `runScheduledProactiveTick` / `startScheduledProactiveLoop`（30 秒心跳，DSH 就绪时启动）；
+  - 新增唤醒原因 `scheduled:<id>` 及【定点主动】提示词分支；
+  - `TIMER_WAKE_REASONS` 加 `scheduled`；`sendWakePromptV2` 的 `autoWake` 改为按 `:` 前基名判断；
+  - `saveSocialV2State` 白名单新增 `scheduledProactiveFired` / `lastScheduledProactiveError`。
+- `config.example.json`：新增 `socialV2.scheduledProactive` 示例。
+- `scripts/audit-bridge-harness.mjs`：注入新模块、导出三个函数供测试。
+- `scripts/test-scheduled-proactive.mjs`（新增）：7 个用例。
+
+**case**：`docs/cases/2026-11-10-qq-scheduled-proactive.md` · PITFALLS #127
+
+**验证**：
+- `node scripts/test-scheduled-proactive.mjs` → 7/7 通过
+- `node scripts/test-audit-regressions.mjs` → 全部通过
+- `node scripts/test-audit.mjs` → **140/143**，3 条失败均为 `test-audit-setup.mjs` 的
+  `fs.cpSync` 环境问题（`node_modules/js-yaml` 静默不复制），**主工作区同样复现**，与本批无关
+
+**回滚**：`config.json` 删掉/关闭 `scheduledProactive` 并重启桥接；无数据迁移。
+
+<!-- 交接块 -->
+**交给发布会话**：本批只动了桥接进程，**DSH 不用重启**。合并后需在 `config.json` 里配好
+`scheduledProactive.items`（`config.json` 是 gitignore 的运行期文件，不随提交走），
+否则装载后仍是 `items: []`、行为与现在完全一致（即默认无感）。
+
+
 ### 批次 2026-11-10 17:00 · QQ 表情（收藏表情呈现）
 
 <!-- release-batch: start=2026-11-10T16:00+08:00 end=2026-11-10T17:00+08:00 commits=uncommitted -->

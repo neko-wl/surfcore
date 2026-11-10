@@ -346,6 +346,18 @@
       "idleThresholdMs": 900000,
       "probability": 0.3
     },
+    "scheduledProactive": {
+      "enabled": true,
+      "items": [
+        {
+          "id": "night-check",
+          "time": "23:30",
+          "keys": ["private:123456"],
+          "text": "约定的查岗：催对方去睡",
+          "graceMs": 1800000
+        }
+      ]
+    },
     "feedback": {
       "maxLength": 500,
       "notifyOwnerOnError": false
