@@ -21,8 +21,9 @@
 
 <!-- release-batch: start=2026-11-11T01:20+08:00 end=2026-11-11T01:45+08:00 commits=feat/promise-noshow -->
 
-**覆盖提交**：`feat/promise-noshow`（在反向承诺之上叠加）
-**建议**：随前两批一起发 **0.9.1（patch）**
+**覆盖提交**：已合入 `dev`，覆盖至 `18aae43`（本批对应 `c835c49` + 三处修复
+`0fbe6d8` / `7bec9d8` / `18aae43`）
+**建议**：并入 **0.9.0（minor）** —— 和表情/点歌一批带走
 
 **改了什么**：
 - `src/promise-time.mjs`：新增 `detectVaguePromise` / `computeVagueFireAt` / `VAGUE_CUE_RE`。
@@ -46,8 +47,8 @@
 
 <!-- release-batch: start=2026-11-11T01:00+08:00 end=2026-11-11T01:30+08:00 commits=feat/promise-noshow -->
 
-**覆盖提交**：`feat/promise-noshow`（在 promise 那批之上叠加）
-**建议**：随上一批一起发 **0.9.1（patch）**
+**覆盖提交**：已合入 `dev`（`66b78ac`）
+**建议**：并入 **0.9.0（minor）**
 
 **改了什么**：
 - `src/promise-time.mjs`：新增 `detectIncomingPromise`、`computeAskFireAt`、`INCOMING_CUE_RE`；
@@ -73,8 +74,8 @@
 
 <!-- release-batch: start=2026-11-11T00:10+08:00 end=2026-11-11T01:05+08:00 commits=feat/proactive-timer -->
 
-**覆盖提交**：`feat/proactive-timer`（含已废弃的 `scheduledProactive` 的拆除，见下方「回滚」）
-**建议**：**0.9.1（patch）** —— 新增一个 MCP 工具 + 一条主动通道，默认开启但只在出现约定时才动作
+**覆盖提交**：已合入 `dev`（`2125d55`，含已废弃的 `scheduledProactive` 拆除 `55df2f2`）
+**建议**：并入 **0.9.0（minor）** —— 新增 MCP 工具 + 主动通道，默认开启但只在出现约定时才动作
 
 **改了什么**：
 - `src/promise-time.mjs`（新增）：`parseChineseNumber` / `parseClockTime` / `detectPromise` /
