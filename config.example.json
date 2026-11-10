@@ -346,6 +346,18 @@
       "idleThresholdMs": 900000,
       "probability": 0.3
     },
+    "promise": {
+      "enabled": true,
+      "leadMs": 600000,
+      "graceMs": 1800000,
+      "scanEnabled": true,
+      "maxPending": 5,
+      "missMs": 600000,
+      "askWindowMs": 600000,
+      "noshowGraceMs": 7200000,
+      "vagueMinMs": 3600000,
+      "vagueMaxMs": 7200000
+    },
     "feedback": {
       "maxLength": 500,
       "notifyOwnerOnError": false

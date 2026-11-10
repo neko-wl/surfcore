@@ -10,6 +10,7 @@ import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { computeAskFireAt, computePromiseFireAt, computeVagueFireAt, detectIncomingPromise, detectPromise, detectVaguePromise, parseHHMM } from './promise-time.mjs';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
@@ -978,6 +979,20 @@ function loadConfig() {
       autoReplyCheckMs: 30000,
       agentPreset: 'qq-chat-v2',
       provideRecommendations: true,
+      // 承诺定时：她在聊天里答应了具体时间，就在 [forAt-leadMs, forAt] 之间随机醒一次去赴约。
+      // 两个入口：工具 qq_set_promise（精确）+ 扫描她发出的消息（兜住「说了但没登记」）。
+      // 背景：主动机会是 30~90 分钟随机 + 概率判定，聊天里那句承诺本来没有任何东西把它变成定时器。
+      promise: {
+        enabled: true,
+        leadMs: 10 * 60 * 1000,
+        graceMs: 30 * 60 * 1000,
+        scanEnabled: true,
+        maxPending: 5,
+        // 反向：对方答应来找她，到点后等 missMs 还没人来 → 在 [T+miss, T+miss+askWindow] 里追问。
+        missMs: 10 * 60 * 1000,
+        askWindowMs: 10 * 60 * 1000,
+        noshowGraceMs: 2 * 60 * 60 * 1000
+      },
       tools: {
         getPrompt: true,
 
@@ -1008,7 +1023,8 @@ function loadConfig() {
         stickerNote: true,
         collectSticker: true,
         getSelfImage: true,
-        closeConversation: true
+        closeConversation: true,
+        setPromise: true
       },
       wake: {
         defaultMode: 'diving',
@@ -1844,6 +1860,7 @@ async function main() {
   let purposeStateMtime = 0;
   savePurposeState();
   let purposeTimer = null;
+  let promiseTimer = null;
   let purposeRun = null; // { runId, at, key, sessionId, planned, sentTexts, timer }
   let purposeLastLog = { at: 0, reason: '', nextFireAt: 0 };
 
@@ -2359,6 +2376,36 @@ async function main() {
    * 只**检查**不占额度：额度在真正发出去之后才由 voiceBudgetCommit 记账 ——
    * 这样参数错、被审计拦截、网关失败都不会白白吃掉配额（否则连失败几次就被假 429 卡住）。
    */
+  /**
+   * 表情图库图片解析（安全边界）：只允许 meme 图库目录内的文件。
+   *
+   * 为什么单独一条边界：send-image 是把本地图片编码成 base64 发出去，
+   * 如果接受任意路径，等于给了「读任意文件并外发」的通道。
+   * 允许的根：$DSH_HOME/meme-packs、配置 socialV2.meme.dir，以及 dsh-meme 自带的
+   * node_modules/dsh-meme/memes（自带 pack 就在那里）。
+   */
+  function resolveMemeImagePathForOperator(input) {
+    const raw = String(input ?? '').trim();
+    if (!raw) throw new Error('缺少图片：给图库里的图片路径或文件名');
+    if (/^(https?:|base64:|data:)/i.test(raw)) throw new Error('只接受本地图库文件，不接受 URL/base64');
+    const abs = path.resolve(raw);
+    let real;
+    try { real = fs.realpathSync(abs); } catch { throw new Error('文件不存在'); }
+    let st;
+    try { st = fs.statSync(real); } catch { throw new Error('文件读不到'); }
+    if (!st.isFile()) throw new Error('不是文件');
+    if (!/\.(png|jpe?g|gif|webp)$/i.test(real)) throw new Error('只支持 png/jpg/gif/webp');
+    const home = os.homedir();
+    const roots = [
+      path.join(home, '.dsh', 'meme-packs'),
+      cfg.socialV2?.meme?.dir ? path.resolve(String(cfg.socialV2.meme.dir)) : null,
+    ].filter(Boolean).map((r) => { try { return fs.realpathSync(r); } catch { return r; } });
+    const inRoots = roots.some((root) => real === root || real.startsWith(root + path.sep));
+    const inBundledPack = real.split(path.sep).join('/').includes('/node_modules/dsh-meme/memes/');
+    if (!inRoots && !inBundledPack) throw new Error('只允许发送表情图库目录内的图片');
+    return real;
+  }
+
   function voiceBudgetCheck(scopeKey, cfgV) {
     const now = Date.now();
     const bucket = voiceSendTimes.get(scopeKey) ?? [];
@@ -3847,6 +3894,8 @@ async function main() {
         if (cfg.purpose?.enabled !== false) {
           try { startPurposeLoop(); } catch (error) { log(`[目的] 启动失败：${error?.message ?? error}`); }
         }
+        // 承诺定时：她说「今晚 11:30 来找你」，到点就得有人把她叫醒去赴约。
+        try { startPromiseLoop(); } catch (error) { log(`[承诺] 启动失败：${error?.message ?? error}`); }
         if (currentMode === 'reserved2') {
           // 首次确定模式为 reserved2 后再恢复持久化的有限睡眠定时器，
           // 避免在 initial chat 模式下设置定时器导致 timeout 唤醒被模式守卫吞掉。
@@ -7994,6 +8043,238 @@ async function main() {
           }
           return;
         }
+        // 文件发送：把语音库里的文件当作「QQ 文件」发出去。
+        // 用途：完整歌曲（语音条有 300 秒 / 20MB 限制，文件没有）。
+        // 安全：只允许语音库目录内的文件（resolveVoicePathForOperator 会拒绝目录外路径）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-file') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const km = /^(group|private):(\d+)$/.exec(key);
+          if (!km) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          let resolved;
+          try {
+            resolved = resolveVoicePathForOperator(body.file ?? body.name ?? '');
+          } catch (error) {
+            sendJson({ ok: false, error: `文件不可用：${error?.message ?? error}` }, 400);
+            return;
+          }
+          const name = String(body.name ?? '').trim() || path.basename(resolved.path);
+          let size = 0;
+          try { size = fs.statSync(resolved.path).size; } catch { sendJson({ ok: false, error: '文件读不到' }, 400); return; }
+          if (size > 200 * 1024 * 1024) {
+            sendJson({ ok: false, error: `文件太大（${(size / 1048576).toFixed(0)}MB > 200MB）`, hint: '先压缩或切段再发' }, 413);
+            return;
+          }
+          const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          const action = km[1] === 'private' ? 'upload_private_file' : 'upload_group_file';
+          const params = km[1] === 'private'
+            ? { user_id: Number(km[2]), file: resolved.path, name }
+            : { group_id: Number(km[2]), file: resolved.path, name };
+          try {
+            const res = await fetch(`${httpUrl}/${action}`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+              },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(120000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) {
+              throw new Error(`OneBot ${action} 失败：${rb.wording || rb.retcode || res.status}`);
+            }
+            log(`[file] ${key} 已发送文件 ${name} (${(size / 1048576).toFixed(1)}MB)`);
+            appendActivity(`${key} [file] 发送文件 ${name} (${(size / 1048576).toFixed(1)}MB)`);
+            sendJson({ ok: true, key, file: path.basename(resolved.path), name, bytes: size, detail: `${(size / 1048576).toFixed(1)}MB`, onebot: rb.data ?? {} });
+          } catch (error) {
+            log(`[file] 发送失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `发送文件失败：${error?.message ?? error}`, hint: 'SnowLuma 的 upload_private_file / upload_group_file 可能不可用，可改用语音条' }, 502);
+          }
+          return;
+        }
+        // 表情图库 → QQ 收藏表情（sticker 呈现）：先 add_custom_face 收进账号收藏，再 send_custom_face 发出去。
+        // 为什么不用 image 段：image 在 QQ 里显示成「图片」（带边框、可点开），收藏表情才是表情面板那种。
+        // 同一张图只收藏一次（按 sha256 缓存 emoji_id），避免把收藏夹刷满。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-meme') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          const consoleOk = (() => { const ct = String(cfg.consoleToken ?? ''); const st = String(req.headers['x-console-token'] ?? '').trim(); return Boolean(ct) && ct === st; })();
+          if (!agentTokenOk(key, token) && !consoleOk) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const km = /^(group|private):(\d+)$/.exec(key);
+          if (!km) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          let imagePath;
+          try {
+            imagePath = resolveMemeImagePathForOperator(body.file ?? '');
+          } catch (error) {
+            sendJson({ ok: false, error: `图片不可用：${error?.message ?? error}` }, 400);
+            return;
+          }
+          let buffer;
+          try { buffer = fs.readFileSync(imagePath); } catch (error) { sendJson({ ok: false, error: `读取图片失败：${error?.message ?? error}` }, 500); return; }
+          if (buffer.length > 8 * 1024 * 1024) { sendJson({ ok: false, error: `图片太大（${(buffer.length / 1048576).toFixed(1)}MB > 8MB）` }, 413); return; }
+          const sha = crypto.createHash('sha256').update(buffer).digest('hex');
+          const cacheFile = path.join(ROOT, 'state', 'meme-favorites.json');
+          let cache = {};
+          try { cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch { cache = {}; }
+          let emojiId = String(cache[sha] ?? '').trim();
+          let added = false;
+          if (!emojiId) {
+            try {
+              const addRes = await bot.request('add_custom_face', { file: 'base64://' + buffer.toString('base64') });
+              if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
+                throw new Error(addRes?.wording || addRes?.retcode || 'unknown');
+              }
+              emojiId = String(addRes.data?.emoji_id ?? '').trim();
+              if (!emojiId) throw new Error('未返回 emoji_id');
+              cache[sha] = emojiId;
+              added = true;
+              try { fs.mkdirSync(path.dirname(cacheFile), { recursive: true }); fs.writeFileSync(cacheFile, JSON.stringify(cache, null, 2)); } catch {}
+            } catch (error) {
+              log(`[meme] add_custom_face 失败，回退发普通图片：${error?.message ?? error}`);
+              emojiId = '';
+            }
+          }
+          let messageId = null;
+          let via = 'sticker';
+          if (emojiId) {
+            try {
+              const params = km[1] === 'private' ? { user_id: Number(km[2]), emoji_id: emojiId } : { group_id: Number(km[2]), emoji_id: emojiId };
+              const sendRes = await bot.request('send_custom_face', params);
+              if (!sendRes || sendRes.status !== 'ok' || sendRes.retcode !== 0) throw new Error(sendRes?.wording || sendRes?.retcode || 'unknown');
+              messageId = sendRes.data?.message_id ?? null;
+            } catch (error) {
+              log(`[meme] send_custom_face 失败，回退发普通图片：${error?.message ?? error}`);
+              emojiId = '';
+            }
+          }
+          if (!emojiId) {
+            // 回退：收藏接口不可用时仍然发图，不让表情功能整体失效。
+            via = 'image';
+            const segments = [{ type: 'image', data: { file: 'base64://' + buffer.toString('base64') } }];
+            const action = km[1] === 'private' ? 'send_private_msg' : 'send_group_msg';
+            const params = km[1] === 'private' ? { user_id: Number(km[2]), message: segments } : { group_id: Number(km[2]), message: segments };
+            try {
+              const res = await fetch(`${String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '')}/${action}`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+                body: JSON.stringify(params),
+                signal: AbortSignal.timeout(60000)
+              });
+              const rb = await res.json().catch(() => ({}));
+              if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) throw new Error(rb.wording || rb.retcode || res.status);
+              messageId = rb.data?.message_id ?? null;
+            } catch (error) {
+              sendJson({ ok: false, error: `发送表情失败：${error?.message ?? error}` }, 502);
+              return;
+            }
+          }
+          log(`[meme] ${key} ${via === 'sticker' ? '收藏表情' : '图片'} ${path.basename(imagePath)} (${(buffer.length / 1024).toFixed(0)}KB)${added ? ' [新收藏]' : ''}`);
+          appendActivity(`${key} [meme] 发送表情 ${path.basename(imagePath)}`);
+          sendJson({ ok: true, key, file: path.basename(imagePath), via, added, emojiId, messageId, bytes: buffer.length });
+          return;
+        }
+        // 承诺定时：她自己登记「我几点来找你」。只认 24 小时制 HH:MM；
+        // 传的时间已经过去就顺延到明天（否则 23:31 登记 23:30 会直接算过期）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/promise') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, code: 'promise.missing-key', error: 'key 不能为空（格式 group:群号 或 private:QQ号）', hint: '带上会话 key' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, code: 'promise.mode', error: '该接口仅 reserved2 模式可用', hint: '切到二代仿真模式' }, 403); return; }
+          if (!v2ToolEnabled('setPromise')) { sendJson({ ok: false, code: 'promise.tool-disabled', error: '工具未启用：qq_set_promise', hint: '控制台打开该工具开关' }, 403); return; }
+          if (!token) { sendJson({ ok: false, code: 'promise.missing-token', error: 'reserved2 模式必须携带 agent token', hint: '带上唤醒提示里的会话令牌' }, 403); return; }
+          const consoleOk = (() => { const ct = String(cfg.consoleToken ?? ''); const st = String(req.headers['x-console-token'] ?? '').trim(); return Boolean(ct) && ct === st; })();
+          if (!agentTokenOk(key, token) && !consoleOk) { sendJson({ ok: false, code: 'promise.bad-token', error: 'agent token 无效', hint: '使用唤醒提示中的【会话令牌】' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, code: 'promise.not-allowed', error: '目标不在当前模式允许范围内', hint: '检查 config.json 的 allow 白名单' }, 403); return; }
+          if (body.cancel === true) { sendJson(cancelPromiseV2(key, String(body.id ?? '').trim())); return; }
+          if (body.vague === true) {
+            // 「晚点/稍后」这种没有钟点的承诺：不用给 time，按 1~2 小时窗口兜。
+            sendJson(registerPromiseV2(key, { text: body.text, source: 'tool', direction: body.direction === 'in' ? 'in' : 'out', kind: 'vague' }));
+            return;
+          }
+          const parsed = parseHHMM(body.time) ?? (body.text ? detectPromise(String(body.text), Date.now()) : null);
+          if (!parsed) { sendJson({ ok: false, code: 'promise.bad-time', error: '时间格式无法识别', hint: '传 24 小时制 HH:MM（例如 23:30），或一句带时间的原话' }, 400); return; }
+          let forAt = Number(parsed.forAt);
+          if (!Number.isFinite(forAt)) {
+            const base = new Date();
+            base.setHours(parsed.hour, parsed.minute, 0, 0);
+            forAt = base.getTime();
+            if (forAt <= Date.now()) forAt += 24 * 60 * 60 * 1000;
+          }
+          sendJson(registerPromiseV2(key, { forAt, text: body.text, source: 'tool', direction: body.direction === 'in' ? 'in' : 'out' }));
+          return;
+        }
+        // 表情图库发图：本地图片 → image 段 → SnowLuma（QQ 通道没有渲染层，只能直接发图）。
+        // 安全边界：只允许 meme 图库目录内的文件（防 prompt injection 拿任意本地图片外发）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-image') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          const consoleOk = (() => { const ct = String(cfg.consoleToken ?? ''); const st = String(req.headers['x-console-token'] ?? '').trim(); return Boolean(ct) && ct === st; })();
+          if (!agentTokenOk(key, token) && !consoleOk) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const km = /^(group|private):(\d+)$/.exec(key);
+          if (!km) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          let imagePath;
+          try {
+            imagePath = resolveMemeImagePathForOperator(body.file ?? '');
+          } catch (error) {
+            sendJson({ ok: false, error: `图片不可用：${error?.message ?? error}` }, 400);
+            return;
+          }
+          let size = 0;
+          try { size = fs.statSync(imagePath).size; } catch { sendJson({ ok: false, error: '图片读不到' }, 400); return; }
+          if (size > 8 * 1024 * 1024) { sendJson({ ok: false, error: `图片太大（${(size / 1048576).toFixed(1)}MB > 8MB）` }, 413); return; }
+          let buffer;
+          try { buffer = fs.readFileSync(imagePath); } catch (error) { sendJson({ ok: false, error: `读取图片失败：${error?.message ?? error}` }, 500); return; }
+          const segments = [];
+          if (body.replyToMessageId !== undefined && body.replyToMessageId !== null && String(body.replyToMessageId).trim() !== '') {
+            const rid = String(body.replyToMessageId).trim();
+            if (!/^-?[1-9]\d*$/.test(rid)) { sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数' }, 400); return; }
+            segments.push({ type: 'reply', data: { id: rid } });
+          }
+          segments.push({ type: 'image', data: { file: 'base64://' + buffer.toString('base64') } });
+          const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          const action = km[1] === 'private' ? 'send_private_msg' : 'send_group_msg';
+          const params = km[1] === 'private' ? { user_id: Number(km[2]), message: segments } : { group_id: Number(km[2]), message: segments };
+          try {
+            const res = await fetch(`${httpUrl}/${action}`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+              },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(60000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) {
+              throw new Error(`OneBot ${action} 失败：${rb.wording || rb.retcode || res.status}`);
+            }
+            log(`[meme] ${key} 已发送图片 ${path.basename(imagePath)} (${(size / 1024).toFixed(0)}KB)`);
+            appendActivity(`${key} [meme] 发送表情 ${path.basename(imagePath)}`);
+            sendJson({ ok: true, key, file: path.basename(imagePath), bytes: size, messageId: rb.data?.message_id ?? null });
+          } catch (error) {
+            log(`[meme] 发送失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `发送图片失败：${error?.message ?? error}` }, 502);
+          }
+          return;
+        }
         // 语音库列表。两条通道共用：
         //   - 带 agent token（AI 的 qq_list_voices）→ 必须带 key，校验会话白名单/工具开关；
         //   - 不带 agent token（控制台调试面板 / CLI）→ 只需控制台令牌，不需要 key。
@@ -11203,6 +11484,9 @@ async function main() {
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           // 对话收尾记录：只存结论（收在哪 / 下次怎么接）+ 冷却时间，不存额外消息副本。
           closure: st.closure && typeof st.closure === 'object' ? st.closure : undefined,
+          // 定点主动：{ itemId: 'YYYY-MM-DD' | 'missed:YYYY-MM-DD' }，保证同一 item 每天只投递一次。
+          // 承诺定时：pending 条目必须落盘，否则桥接一重启「约好 11:30」就没了。
+          promises: Array.isArray(st.promises) ? st.promises.slice(-20) : undefined,
           // 鱼群保护状态（2026-10-23）：冷却、直呼放行、最近触发记录。
           fishGuard: st.fishGuard && typeof st.fishGuard === 'object' ? st.fishGuard : undefined,
           fishGuardBypass: st.fishGuardBypass && typeof st.fishGuardBypass === 'object' ? st.fishGuardBypass : undefined,
@@ -14011,6 +14295,8 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // 入站承诺：对方说「我 11 点半来找你」→ 登记一条等他赴约的约定（等不到就问）。
+    try { notePromiseFromIncoming(key, msg); } catch {}
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -14085,6 +14371,8 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     // 目的机制：这一发是不是「主动找主人」那一回合里真发出去的；是就记下来，回合结束记 sent。
     try { notePurposeOutbound(key, list); } catch {}
+    // 承诺定时：她说「今晚 11:30 来找你」，就在出站这一刻把约定记进 state（不依赖她记得调工具）。
+    try { notePromiseFromOutbound(key, list); } catch {}
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
@@ -14659,6 +14947,33 @@ async function main() {
     if (reason === 'proactiveCheck') {
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
+    if (String(reason).startsWith('vague:')) {
+      // 模糊承诺到期：没有具体钟点，只有一个「等会儿」，所以措辞要像「我记着这事」而不是「到点了」。
+      const vagueId = String(reason).slice('vague:'.length);
+      const p = promisesOf(getSocialV2State(key)).find((x) => x.id === vagueId);
+      const quote = p?.text ? `\n当时的原话：「${p.text}」` : '';
+      const outgoing = p?.direction !== 'in';
+      if (outgoing) {
+        return `${base}【接上】${key}\n原因：你之前说过晚点会来找对方，后来一直没再聊，现在过去一两个小时了。${quote}\n主动把这句「晚点」接上——聊两句刚才没说完的，或者随口说句现在的状态。不要道歉式地解释「我忘了」，也不提「定时」「提醒」「系统」。`;
+      }
+      return `${base}【没等到】${key}\n原因：对方说过晚点回来找你，之后一直没动静，现在过去一两个小时了。${quote}\n主动问一句，自然点——可以打趣地催、也可以说你在等他，但别质问、别说「你不是说晚点吗」。不提「定时」「提醒」「系统」。`;
+    }
+    if (String(reason).startsWith('noshow:')) {
+      // 等不到人：约定的是**对方**的时间，过了点还没动静，她主动问一句。
+      const noshowId = String(reason).slice('noshow:'.length);
+      const p = promisesOf(getSocialV2State(key)).find((x) => x.id === noshowId);
+      const when = p ? clockText(p.forAt) : '';
+      const quote = p?.text ? `\n对方当时是这么说的：「${p.text}」` : '';
+      return `${base}【没等到人】${key}\n原因：约好 ${when || '那个点'} 对方过来找你，现在已经过了约定时间，而且这段时间他没发过任何消息。${quote}\n主动问一句，自然点——像你真的在等，而不是在执行检查。可以带点情绪（团着等、有点委屈、或者打趣地催），但别质问、别说「你是不是忘了」。不提「定时」「提醒」「系统」。`;
+    }
+    if (String(reason).startsWith('promise:')) {
+      // 赴约：这是她自己答应过的时间点，提示词要让她当成「我自己记着」，别暴露定时器。
+      const promiseId = String(reason).slice('promise:'.length);
+      const p = promisesOf(getSocialV2State(key)).find((x) => x.id === promiseId);
+      const when = p ? clockText(p.forAt) : '';
+      const quote = p?.text ? `\n你当时是这么说的：「${p.text}」` : '';
+      return `${base}【赴约】${key}\n原因：你之前亲口答应过 ${when || '这个点'} 要来找对方，现在到时间了。${quote}\n主动开口，一两句就够，语气自然。不要提「定时」「提醒」「系统」，就当是你自己记着的。`;
+    }
     if (reason === 'history') {
       return `${base}【上线补历史】${key}\n原因：你刚上线，桥接用 QQ 历史记录把离线期间错过的消息补进了未读（消息带 history=true；若本次快照没内联，可调用 qq_get_context_snapshot(include=["unread"]) 查看）。\n先快速扫一遍补上下文；这些是已经发生的旧消息，除非仍然相关，不要逐条回复或引用，也不要当成刚刚发生。看完可以用 qq_mark_read 或 qq_set_wake_config 安静收尾。`;
     }
@@ -14686,7 +15001,7 @@ async function main() {
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
     const stForGuard = getSocialV2State(key);
-    const autoWake = ['proactiveCheck', 'timeout', 'replyCheck', 'history', 'bootstrap'].includes(String(reason));
+    const autoWake = ['proactiveCheck', 'timeout', 'replyCheck', 'history', 'bootstrap', 'scheduled', 'promise', 'noshow', 'vague'].includes(String(reason).split(':')[0]);
     const channel = qqSendChannelStatus();
     if (!channel.ok) {
       if (!stForGuard.channelGateLoggedAt || Date.now() - stForGuard.channelGateLoggedAt > 10 * 60 * 1000) {
@@ -14980,7 +15295,7 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导/上线补历史）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'history', 'backlog']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'history', 'backlog', 'promise', 'noshow', 'vague']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -15422,6 +15737,258 @@ async function main() {
     }, delay);
     st.proactiveTimer.unref?.();
     log(`[reserved2] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
+  }
+
+  function startPromiseLoop() {
+    if (promiseTimer) return;
+    promiseTimer = setInterval(runPromiseTick, 30 * 1000);
+    promiseTimer.unref?.();
+    log('[承诺] 已启动：每 30 秒检查一次待赴的约定');
+    // 启动即看一次：停机期间正好到点的，开机就补。
+    setTimeout(runPromiseTick, 3000).unref?.();
+  }
+
+  // ── 承诺定时（promise）──────────────────────────────────────────────────
+  // 需求：她在聊天里说「今晚 11:30 来找你」，系统就要在 23:20~23:30 之间自己醒一次去赴约。
+  // 两个入口：
+  //   1) 工具 qq_set_promise —— 精确，她自己登记；
+  //   2) 出站扫描 —— 从她发出去的话里认时间，兜住「说了但忘了调工具」。
+  // 为什么必须两个都有：只靠工具，她忘调就整条链断（这就是本次事故的形态）；
+  // 只靠扫描，中文时间表达会误报。合起来：工具优先，扫描补位，同一时刻去重。
+  function promiseConfigV2() {
+    const p = cfg.socialV2?.promise ?? {};
+    return {
+      enabled: p.enabled !== false,
+      leadMs: Math.max(0, Number(p.leadMs ?? 10 * 60 * 1000) || 0),
+      graceMs: Math.max(0, Number(p.graceMs ?? 30 * 60 * 1000) || 0),
+      scanEnabled: p.scanEnabled !== false,
+      maxPending: Math.max(1, Number(p.maxPending ?? 5) || 5),
+      // 入站方向的「等不到人」参数：约定 23:30 → 23:40 算没出现 → 23:40~23:50 之间追问。
+      missMs: Math.max(0, Number(p.missMs ?? 10 * 60 * 1000) || 0),
+      askWindowMs: Math.max(0, Number(p.askWindowMs ?? 10 * 60 * 1000) || 0),
+      noshowGraceMs: Math.max(0, Number(p.noshowGraceMs ?? 2 * 60 * 60 * 1000) || 0),
+      // 模糊承诺（「晚点」「稍后」）：从说这句话起 1~2 小时内随机，且期间没再聊才触发。
+      vagueMinMs: Math.max(0, Number(p.vagueMinMs ?? 60 * 60 * 1000) || 0),
+      vagueMaxMs: Math.max(0, Number(p.vagueMaxMs ?? 2 * 60 * 60 * 1000) || 0)
+    };
+  }
+
+  function promisesOf(st) {
+    if (!Array.isArray(st.promises)) st.promises = [];
+    return st.promises;
+  }
+
+  function clockText(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+
+  function registerPromiseV2(key, { forAt, text, source, direction, kind }) {
+    const conf = promiseConfigV2();
+    if (!conf.enabled) return { ok: false, code: 'promise.disabled', error: '承诺定时已关闭', hint: '在 config.json 的 socialV2.promise.enabled 打开' };
+    // out = 她答应来找对方；in = 对方答应来找她。
+    const dir = direction === 'in' ? 'in' : 'out';
+    // vague = 只有「晚点/稍后」，没有具体时刻 —— 用「1~2 小时内随机 + 期间没聊」代替时刻。
+    const vague = kind === 'vague';
+    const at = vague ? 0 : Number(forAt);
+    if (!vague) {
+      if (!Number.isFinite(at)) return { ok: false, code: 'promise.bad-time', error: '时间无效', hint: '传 HH:MM（24 小时制）' };
+      if (at <= Date.now()) return { ok: false, code: 'promise.past', error: '这个时间点已经过去了', hint: '给一个还没到的时间，或用明天的时刻' };
+    }
+
+    const st = getSocialV2State(key);
+    const list = promisesOf(st);
+    const now = Date.now();
+    // 同方向、同类、5 分钟内只留一条：工具登记 + 扫描兜底很容易同时命中同一句话。
+    const dup = list.find((p) => p.status === 'pending'
+      && (p.direction ?? 'out') === dir
+      && (p.kind === 'vague') === vague
+      && Math.abs((vague ? Number(p.createdAt) : Number(p.forAt)) - (vague ? now : at)) < 5 * 60 * 1000);
+    if (dup) return { ok: true, duplicated: true, promise: dup };
+
+    const item = {
+      id: `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      forAt: vague ? null : at,
+      direction: dir,
+      kind: vague ? 'vague' : 'exact',
+      text: String(text ?? '').slice(0, 200),
+      source: source === 'scan' ? 'scan' : 'tool',
+      status: 'pending',
+      createdAt: now
+    };
+    if (vague) item.fireAt = computeVagueFireAt(now, conf.vagueMinMs, conf.vagueMaxMs);
+    else if (dir === 'in') item.askAt = Math.max(now, computeAskFireAt(at, conf.missMs, conf.askWindowMs));
+    // 登记时如果已经进入提前量窗口（比如 01:31 才登记 01:33 的约定），随机点可能落在过去。
+    // 夹到「现在」，否则日志会打出「将在 01:25 左右唤醒」这种已经过去的时间。
+    else item.fireAt = Math.max(now, computePromiseFireAt(at, conf.leadMs));
+
+    list.push(item);
+    // 只留最近的若干条，避免 state 无限长。
+    while (list.length > conf.maxPending * 3) list.shift();
+    saveSocialV2State();
+    const quote = item.text ? ` · ${item.text.slice(0, 30)}` : '';
+    if (vague) {
+      log(`[承诺] 登记 ${key} 模糊约定（${dir === 'in' ? '对方' : '她'}说「晚点」，${item.source}${quote}）→ ${clockText(item.createdAt + conf.vagueMinMs)}~${clockText(item.createdAt + conf.vagueMaxMs)} 之间随机，且期间没聊才主动`);
+    } else if (dir === 'in') {
+      log(`[承诺] 登记 ${key} 对方的约定 ${clockText(at)}（${item.source}${quote}）→ 若 ${clockText(at + conf.missMs)} 还没人来说话，${clockText(item.askAt)} 左右追问`);
+    } else {
+      log(`[承诺] 登记 ${key} 约定 ${clockText(at)}（${item.source}${quote}）→ 将在 ${clockText(item.fireAt)} 左右唤醒`);
+    }
+    return { ok: true, promise: item };
+  }
+
+  function cancelPromiseV2(key, id) {
+    const st = getSocialV2State(key);
+    const list = promisesOf(st);
+    const target = id ? list.find((p) => p.id === id && p.status === 'pending') : list.find((p) => p.status === 'pending');
+    if (!target) return { ok: false, code: 'promise.not-found', error: '没有待赴的约定', hint: '可能已经过了或已被取消' };
+    target.status = 'cancelled';
+    saveSocialV2State();
+    // 模糊承诺没有 forAt，直接 clockText(null) 会打出 epoch（08:00），别让日志撒谎。
+    log(`[承诺] 取消 ${key} ${target.forAt ? `约定 ${clockText(target.forAt)}` : '模糊约定'}`);
+    return { ok: true, promise: target };
+  }
+
+  /** 统一投递：out 用 promise:<id>（赴约），in 用 noshow:<id>（等不到人的追问）。 */
+  function firePromiseWake(key, st, p, kind) {
+    void sendWakePromptV2(key, `${kind}:${p.id}`).catch((error) => {
+      const message = String(error?.message ?? error).slice(0, 200);
+      log(`[承诺] 唤醒异常 ${key}：${message}`);
+      try {
+        st.lastPromiseError = { at: Date.now(), key, id: p.id, error: message, hint: '检查桥接日志 [channel-gate] / 模式 / 唤醒暂停状态' };
+        saveSocialV2State();
+      } catch {}
+    });
+  }
+
+  function runPromiseTick() {
+    const conf = promiseConfigV2();
+    if (!conf.enabled) return;
+    const now = Date.now();
+    for (const [key, st] of socialV2.conversations) {
+      const list = promisesOf(st);
+      let dirty = false;
+      for (const p of list) {
+        if (!p || p.status !== 'pending') continue;
+
+        if (p.kind === 'vague') {
+          // 「晚点/稍后」：从说这句话起 1~2 小时内随机；期间只要又聊上了，就不主动。
+          if (now > Number(p.createdAt) + conf.vagueMaxMs + conf.noshowGraceMs) {
+            p.status = 'missed';
+            dirty = true;
+            log(`[承诺] 放弃模糊约定 ${key}：已过窗口太久`);
+            continue;
+          }
+          if (now < Number(p.fireAt)) continue;
+          // 「期间没聊天」= 登记之后没收到过入站消息。对方回了他就还在聊，不需要她主动。
+          if (Number(st.lastIncomingAt) > Number(p.createdAt)) {
+            p.status = 'active';
+            dirty = true;
+            log(`[承诺] ${key} 期间又聊上了（${clockText(p.createdAt)} 的「晚点」），不用主动开口`);
+            continue;
+          }
+          p.status = 'fired';
+          p.firedAt = now;
+          dirty = true;
+          log(`[承诺] 模糊约定到期 ${key}：${clockText(p.createdAt)} 说「晚点」，到现在没动静，${clockText(now)} 主动开口`);
+          appendActivity(`${key} [承诺] 模糊约定 ${clockText(p.createdAt)}`);
+          firePromiseWake(key, st, p, 'vague');
+          continue;
+        }
+
+        if (p.direction === 'in') {
+          // 对方答应来找她：到点后等 missMs，还没人来就在下一个窗口里随机问一句。
+          if (now > Number(p.forAt) + conf.noshowGraceMs) {
+            p.status = 'missed';
+            dirty = true;
+            log(`[承诺] 放弃追问 ${key} 约定 ${clockText(p.forAt)}：已过追问窗口`);
+            continue;
+          }
+          const askAt = Number(p.askAt) || Number(p.forAt) + conf.missMs;
+          if (now < askAt) continue;
+          // 「出现」= 约定时刻之后收到过任何一条入站消息；用 lastIncomingAt 判断，
+          // 不依赖 recentMessages 是否被裁掉。
+          if (Number(st.lastIncomingAt) >= Number(p.forAt)) {
+            p.status = 'kept';
+            dirty = true;
+            log(`[承诺] ${key} 如约出现（约定 ${clockText(p.forAt)}），不需要追问`);
+            continue;
+          }
+          p.status = 'fired';
+          p.firedAt = now;
+          dirty = true;
+          log(`[承诺] 到点追问 ${key}：约定 ${clockText(p.forAt)}，等到 ${clockText(now)} 仍没人说话，问一句`);
+          appendActivity(`${key} [承诺] 追问 ${clockText(p.forAt)}`);
+          firePromiseWake(key, st, p, 'noshow');
+          continue;
+        }
+
+        if (now > Number(p.forAt) + conf.graceMs) {
+          p.status = 'missed';
+          dirty = true;
+          log(`[承诺] 错过 ${key} 约定 ${clockText(p.forAt)}：超过补发窗口，今天不再赴约`);
+          continue;
+        }
+        if (now < Number(p.fireAt)) continue;
+        p.status = 'fired';
+        p.firedAt = now;
+        dirty = true;
+        log(`[承诺] 到点赴约 ${key}：约定 ${clockText(p.forAt)}（${p.source}），现在 ${clockText(now)} 叫醒`);
+        appendActivity(`${key} [承诺] 赴约 ${clockText(p.forAt)}`);
+        firePromiseWake(key, st, p, 'promise');
+      }
+      // 一天前已经结束的条目清掉，只留状态机里还有意义的。
+      // 模糊承诺没有 forAt，得回落到 createdAt —— 否则 `now - null` 恒大于 24h，刚结束就被清掉。
+      const before = list.length;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const p = list[i];
+        if (p && p.status !== 'pending' && now - Number(p.forAt || p.createdAt) > 24 * 60 * 60 * 1000) { list.splice(i, 1); dirty = true; }
+      }
+      if (dirty || list.length !== before) saveSocialV2State();
+    }
+  }
+
+  /** 出站扫描：她刚发出去的话里如果带了「几点见」，就登记一条。 */
+  function notePromiseFromOutbound(key, messages) {
+    const conf = promiseConfigV2();
+    if (!conf.enabled || !conf.scanEnabled) return;
+    const now = Date.now();
+    for (const raw of Array.isArray(messages) ? messages : []) {
+      const text = String(raw ?? '');
+      const hit = detectPromise(text, now);
+      if (hit) {
+        const res = registerPromiseV2(key, { forAt: hit.forAt, text: hit.raw, source: 'scan' });
+        if (res?.ok && !res.duplicated) appendActivity(`${key} [承诺] 从发言里认出约定 ${clockText(hit.forAt)}`);
+        continue;
+      }
+      // 没有具体钟点，但说了「晚点/稍后」——按 1~2 小时窗口兜。
+      const vague = detectVaguePromise(text, 'out');
+      if (vague) {
+        const res = registerPromiseV2(key, { text: vague.raw, source: 'scan', direction: 'out', kind: 'vague' });
+        if (res?.ok && !res.duplicated) appendActivity(`${key} [承诺] 从发言里认出模糊约定`);
+      }
+    }
+  }
+
+  /** 入站扫描：对方（多半是主人）说「我 11 点半来找你」，就登记一条等他赴约的约定。 */
+  function notePromiseFromIncoming(key, msg) {
+    const conf = promiseConfigV2();
+    if (!conf.enabled || !conf.scanEnabled) return;
+    if (!msg || msg.isSelf) return;
+    // 群里只在主人说话时登记：别人一句「我一会儿过来」不该让她整点去催。
+    if (!String(key).startsWith('private:') && !msg.isOwner) return;
+    const text = String(msg.text ?? msg.plain ?? '');
+    const hit = detectIncomingPromise(text, Date.now());
+    if (hit) {
+      const res = registerPromiseV2(key, { forAt: hit.forAt, text: hit.raw, source: 'scan', direction: 'in' });
+      if (res?.ok && !res.duplicated) appendActivity(`${key} [承诺] 从对方的发言里认出约定 ${clockText(hit.forAt)}`);
+      return;
+    }
+    const vague = detectVaguePromise(text, 'in');
+    if (vague) {
+      const res = registerPromiseV2(key, { text: vague.raw, source: 'scan', direction: 'in', kind: 'vague' });
+      if (res?.ok && !res.duplicated) appendActivity(`${key} [承诺] 从对方的发言里认出模糊约定`);
+    }
   }
 
   function clearSocialV2Timers(key) {

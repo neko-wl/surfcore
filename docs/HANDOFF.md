@@ -2836,3 +2836,18 @@
 3. 发布方式：`github.com:443` 经常不通 → 用 `scripts/publish-via-api.mjs`（走 api.github.com），
    `--since <本地已有的远端祖先>` 用于 API 造提交后本地没有远端树的情况。
 4. 发完回填：`CHANGELOG.md`、本文件「尚未验证」、需要时 `PITFALLS.md`。
+
+## 2026-11-10 19:00 · 分支与上游状态（给下一个会话）
+
+- 仓库已能正常用 git：`D:\tools\git\cmd\git.exe`（2.56.0，MinGit 便携版，已加用户 PATH）。
+- 远程双源：`origin` = `neko-wl/surfcore`（自己的 fork，可推）；`upstream` = `Mieksido/surfcore`（原作者，只读）。
+- 当前分支 `dev`，HEAD = `c3f2a27 feat(qq): 点歌链路与表情收藏接入`（6 文件 +972 行）。
+  已推到 `origin/dev`，`main` 未动。
+- **上游比 dev 新一个版本**：`upstream/main` = `0ce8580 release: v0.8.9`（160 文件，+16764/-308）。
+  与本地改动重叠的文件：`src/bridge.js`（上游 +534/-39）、`src/mcp-snowluma-safe.js`（+69）、
+  `docs/cases/README.md`（+9）。
+- **决定（用户 2026-11-10）**：先发自己的 0.9.0（点歌 + 表情），**之后再单独合并 upstream 0.8.9**，
+  不要和发布混在一起；合并时建议开独立 worktree，别动当前脏工作区。
+- 工作区还有非本会话的脏文件，别顺手提交：`package-lock.json`、`plugins/surfcore/lib/bridge.js`、
+  `src/state-acl.mjs`，以及未跟踪的 `plugins/surfcore/{bin,tools/bin,tools/covers}`。
+

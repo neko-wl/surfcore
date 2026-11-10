@@ -17,6 +17,212 @@
 > **2026-11-03 04:05：v0.8.7 已发布**，覆盖本表截至该时间的全部待发布批次（0.8.6 以来全部 dev，74 commits）。
 > 以下批次保留作追溯；后续新批次继续加在最上面。
 
+### 批次 2026-11-11 01:45 · QQ 承诺定时（模糊：晚点/稍后）
+
+<!-- release-batch: start=2026-11-11T01:20+08:00 end=2026-11-11T01:45+08:00 commits=feat/promise-noshow -->
+
+**覆盖提交**：已合入 `dev`，覆盖至 `18aae43`（本批对应 `c835c49` + 三处修复
+`0fbe6d8` / `7bec9d8` / `18aae43`）
+**建议**：并入 **0.9.0（minor）** —— 和表情/点歌一批带走
+
+**改了什么**：
+- `src/promise-time.mjs`：新增 `detectVaguePromise` / `computeVagueFireAt` / `VAGUE_CUE_RE`。
+- `src/bridge.js`：
+  - promise 增加 `kind`：`exact`（有钟点）/ `vague`（「晚点/稍后」）；
+  - `vague` 无 `forAt`，触发点 = `createdAt + [1h, 2h]` 随机，且要求 `lastIncomingAt <= createdAt`
+    （期间没再聊）才真的开口，否则记 `active`（聊上了，不用打扰）；
+  - 出站/入站扫描在没有具体钟点时回落到模糊识别；
+  - 新增【接上】/【没等到】两条提示词分支，`TIMER_WAKE_REASONS` / `autoWake` 加 `vague`；
+  - `/api/socialV2/promise` 与 `qq_set_promise` 支持 `vague: true`（不用传 time）。
+- `config.example.json`：`promise` 增加 `vagueMinMs` / `vagueMaxMs`。
+- `scripts/test-qq-promise.mjs`：+6 例（模糊识别、窗口、没聊→开口、聊过→不打扰、两方向入口）。
+
+**case**：`docs/cases/2026-11-11-qq-promise.md`（新增「第三种：模糊承诺」）
+
+**验证**：`node scripts/test-qq-promise.mjs` → 25/25。
+
+**回滚**：`socialV2.promise.enabled = false` 并重启桥接。
+
+### 批次 2026-11-11 01:30 · QQ 承诺定时（反向：等不到人就问）
+
+<!-- release-batch: start=2026-11-11T01:00+08:00 end=2026-11-11T01:30+08:00 commits=feat/promise-noshow -->
+
+**覆盖提交**：已合入 `dev`（`66b78ac`）
+**建议**：并入 **0.9.0（minor）**
+
+**改了什么**：
+- `src/promise-time.mjs`：新增 `detectIncomingPromise`、`computeAskFireAt`、`INCOMING_CUE_RE`；
+  把「几点 → 具体时刻」的 12/24 小时制换算抽成 `resolveForAt`，两个方向共用。
+- `src/bridge.js`：
+  - `registerPromiseV2` 支持 `direction`（`out` = 她要来，`in` = 他要来），两个方向各自算触发点；
+  - `runPromiseTick` 按方向分支：`in` 到点后查 `lastIncomingAt` 判断人来没来，
+    没来 → `noshow:<id>` 追问，来了 → `kept`（留痕，不静默跳过）；
+  - `appendSocialV2Message` 挂入站扫描 `notePromiseFromIncoming`（群里只认主人）；
+  - 新增【没等到人】提示词分支；`TIMER_WAKE_REASONS` / `autoWake` 加 `noshow`；
+  - `POST /api/socialV2/promise` 与 `qq_set_promise` 支持 `direction`。
+- `config.example.json`：`promise` 增加 `missMs` / `askWindowMs` / `noshowGraceMs`。
+- `scripts/test-qq-promise.mjs`：+6 例（入站识别、追问窗口、等不到人、人来了、入站扫描）。
+
+**case**：`docs/cases/2026-11-11-qq-promise.md`（新增「反向」一节）
+
+**验证**：`node scripts/test-qq-promise.mjs` → 19/19；`test-audit-regressions` 全过；
+`test-audit` 143/144（唯一失败仍是 `test-audit-setup` 的 cpSync 环境问题）。
+
+**回滚**：`socialV2.promise.enabled = false` 并重启桥接。
+
+### 批次 2026-11-11 01:05 · QQ 承诺定时（她说了几点就按时来）
+
+<!-- release-batch: start=2026-11-11T00:10+08:00 end=2026-11-11T01:05+08:00 commits=feat/proactive-timer -->
+
+**覆盖提交**：已合入 `dev`（`2125d55`，含已废弃的 `scheduledProactive` 拆除 `55df2f2`）
+**建议**：并入 **0.9.0（minor）** —— 新增 MCP 工具 + 主动通道，默认开启但只在出现约定时才动作
+
+**改了什么**：
+- `src/promise-time.mjs`（新增）：`parseChineseNumber` / `parseClockTime` / `detectPromise` /
+  `computePromiseFireAt` / `parseHHMM`。
+- `src/bridge.js`
+  - 新增 `socialV2.promise` 默认块 + `tools.setPromise`；
+  - 新增 `registerPromiseV2` / `cancelPromiseV2` / `runPromiseTick` / `notePromiseFromOutbound`；
+  - `recordSentMessagesV2` 里挂出站扫描（工具没调也能兜住）；
+  - 30 秒心跳同时驱动定点主动与承诺定时；
+  - 新增 `POST /api/socialV2/promise` 与【赴约】唤醒提示词分支（`promise:<id>`）；
+  - `saveSocialV2State` 白名单新增 `promises`。
+- `src/mcp-snowluma-safe.js`：新增工具 `qq_set_promise` + `TOOL_CONFIG_FLAGS.setPromise`。
+- `config.example.json`：新增 `socialV2.promise` 示例。
+- `scripts/audit-bridge-harness.mjs`：注入 promise-time、导出 5 个函数。
+- `scripts/test-qq-promise.mjs`（新增）：13 个用例。
+
+**case**：`docs/cases/2026-11-11-qq-promise.md` · PITFALLS #128
+
+**验证**：
+- `node scripts/test-qq-promise.mjs` → 13/13
+- `node scripts/test-scheduled-proactive.mjs` → 7/7
+- `node scripts/test-audit-regressions.mjs` → 全部通过
+
+**回滚**：`socialV2.promise.enabled = false` 并重启桥接。
+
+**注意（交接）**：这是**新工具**，DSH 侧必须重启才会重新读取工具清单；只重启桥接不够。
+
+### 批次 2026-11-10 17:00 · QQ 表情（收藏表情呈现）
+
+<!-- release-batch: start=2026-11-10T16:00+08:00 end=2026-11-10T17:00+08:00 commits=uncommitted -->
+
+**覆盖提交**：未提交（本机未安装 git，编辑会话不采样提交）
+**建议**：**0.9.0（minor）** —— 新增两条路由 + 一个新 MCP 工具，用户可见新能力
+
+**改了什么**：
+- `src/bridge.js`
+  - 新增 `POST /api/socialV2/send-meme`：图库图片 → `add_custom_face` 收进 QQ 收藏 → `send_custom_face` 以**表情**呈现发出；失败自动回退 `image` 段。
+  - 新增 `resolveMemeImagePathForOperator()`：只允许表情图库目录内的图片（拒 URL/base64/库外路径）。
+  - 新增 `state/meme-favorites.json`：按图片 SHA256 缓存 `emoji_id`，同一张图只收藏一次。
+  - 新增 `POST /api/socialV2/send-image`：纯图片通道（作为回退路径保留）。
+- `src/mcp-snowluma-safe.js`
+  - 新增工具 `meme_qq`：读各图库包 `index.db`，按 tag + 描述打分选图，调 send-meme 发出。
+  - 打分：整词 +10 / 二字词组 +4 / 单字 +1，只在高分附近随机；意图别名表（累→cpu、困→sleep、干饭→daily…）。
+- `docs/cases/2026-11-10-qq-meme-favorites.md` 新增；`docs/cases/README.md` 索引 +1。
+
+**没做**：
+- 没有 bump `package.json`（版本只能由发布会话改，见 AGENTS §1.5）；
+- 没有处理「收藏表情数量上限」的清理策略；
+- 图库仍是 dsh-meme 自带的 24 张，没有扩充。
+
+**验证**：
+```text
+meme_qq { description: "开心" }   → {"via":"sticker","messageId":591897121}
+meme_qq { description: "摸鱼" }   → {"via":"sticker","messageId":2043349797}
+send_custom_face（手工）          → emoji_id 3885646490_0_0_0_CE08..., messageId -1239383503
+收藏夹去重                         → 第二次发同图不再新增收藏
+```
+
+**重启**：DSH（桥接路由与 MCP 工具都在启动时加载）。
+
+**风险**：
+- 首次发某张图会在用户 QQ 收藏夹里新增一条（用户已同意）；
+- 收藏表情有数量上限，图库变大后可能失败（此时自动回退发图片）；
+- 换到不支持 `send_custom_face` 的协议端会走回退路径，呈现为图片而非表情。
+
+**case**：`docs/cases/2026-11-10-qq-meme-favorites.md`
+
+**交接块（可直接转发给发布会话）**：
+```text
+QQ 表情接入收藏表情
+- 覆盖：工作区未提交（本机无 git）
+- surfcore：bridge.js（send-meme / send-image + 图库路径边界）、mcp-snowluma-safe.js（meme_qq）、
+  state/meme-favorites.json（emoji_id 缓存）、docs/cases/2026-11-10-qq-meme-favorites.md
+- 用户可见：让她发表情时，QQ 里显示为收藏表情（不是图片）；图库 24 张，按描述/情绪选图
+- 验证：meme_qq 两条 via=sticker 成功；同图不重复收藏
+- 重启：DSH
+```
+
+---
+
+### 批次 2026-11-09 14:30 · QQ 点歌链路（全自动翻唱）
+
+<!-- release-batch: start=2026-11-09T09:00+08:00 end=2026-11-09T14:30+08:00 commits=uncommitted -->
+
+**覆盖提交**：未提交（工作区改动；建议先提交到 dev 再走发布）
+> ⚠️ 2026-11-09 14:40 备注：编辑机（VM）**未安装 git**，本会话无法提交；提交需在装有 git 的环境执行。列出的路径即待提交清单。
+**建议**：**minor（0.9.0）** —— 新增两个 MCP 工具与一条发文件接口，属用户可见新能力
+
+**改了什么**：
+- `src/mcp-snowluma-safe.js`
+  - 新增 `qq_sing`：点歌（song / seconds / acapella / full / duet），调用 voice-ai 侧 `sing-request.mjs`。
+  - 新增 `qq_send_file`：把语音库文件当 QQ 文件发（完整版用）。
+  - 工具描述里固化失败契约：`VOICE_SERVICE_OFFLINE` / `RENDER_TIMEOUT` / `RENDER_CRASHED` / `SOURCE_TOO_LONG` / `MALE_SONG` / `DUET_DETECTED` + 语音流控话术。
+- `src/bridge.js`
+  - 新增 `POST /api/socialV2/send-file`：agent token 校验、会话白名单、只允许语音库目录、200MB 上限，走 OneBot `upload_private_file` / `upload_group_file`。
+- `config.json`
+  - `socialV2.voice.maxPerHour` 10 → 30（备份 `config.json.bak-2026-11-09-voice-quota`）。
+- `docs/cases/2026-11-09-voice-sing-qq.md` 新增（含两次补充）；`docs/cases/README.md` 索引 +1。
+
+**配套（不在本仓库）**：`D:\Nexus\voice-ai` 的 `client/sing-request.mjs`、`scripts/fetch-audio.mjs`、`config/song-gender.json` 等，属本机运行资产，不进 repo。
+
+**没做**：
+- 没有 git 提交（按多会话规矩只改文件）；
+- 没有自动化测试覆盖 MCP 新工具（手工端到端验证）；
+- 微信/其他平台未接入。
+
+**验证**：
+```text
+# 端到端（VM）
+node D:\Nexus\voice-ai\client\sing-request.mjs --song "小幸运"
+# → {"ok":true,"file":"sing-BV1QL4y1t7z4-43s-sisi.wav","section":"verse","ms":15950}
+
+# 男声原唱被拒
+--song "晴天"        → {"ok":false,"code":"MALE_SONG"}
+# 对唱先问
+--song "学猫叫"      → {"ok":false,"code":"DUET_DETECTED"}
+
+# 文件发送接口
+POST /api/socialV2/send-file {key,file,name} → 200 + onebot.file_id
+```
+
+**重启**：重启 DSH（MCP 工具表 + 桥接路由都是启动时加载）。
+
+**风险**：
+- 点歌单次耗时 15~100 秒（对唱探针另加约 20 秒），QQ 侧体感较慢；
+- 依赖渲染机（5070 Ti）在线，离线时角色只能找借口；
+- `MALE_SONG` / `DUET_DETECTED` 依赖人工维护的歌曲性别表与标题关键词，冷门歌会漏；
+- 语音配额 30 条/小时是全局的，和日常发语音共用。
+
+**case**：`docs/cases/2026-11-09-voice-sing-qq.md`
+**补充（同日 15:20）**：音源改为网易云单一来源（新增 `SONG_NOT_AVAILABLE`，不回退 B 站）；
+默认分离引擎 demucs → karaoke；对唱探针仅对 B 站源启用。详见 case「补充四」。
+
+**交接块（可直接转发给发布会话）**：
+```text
+QQ 点歌链路（对唱/男声筛选版）
+- 覆盖：工作区未提交（先 commit 到 dev）
+- surfcore：mcp-snowluma-safe.js（qq_sing / qq_send_file）、bridge.js（send-file 路由）、
+  config.json（voice.maxPerHour 30）、docs/cases/2026-11-09-voice-sing-qq.md
+- 用户可见：点歌出 30~50 秒语音条；完整版发 QQ 文件；清唱；男声原唱拒绝；
+  对唱先问是否只唱女声；语音配额 30/h
+- 验证：起风了/小幸运 ✅；晴天/告白气球 → MALE_SONG；学猫叫 → DUET_DETECTED
+- 重启：DSH
+```
+
+---
+
 ### 批次 2026-11-03 08:30 · 人格语气层去重
 <!-- release-batch: start=2026-11-03T08:20+08:00 end=2026-11-03T08:30+08:00 commits=2a473a3 -->
 

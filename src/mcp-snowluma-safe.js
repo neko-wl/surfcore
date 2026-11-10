@@ -7,8 +7,11 @@
 //   allow.groups / allow.private，否则拒绝 —— agent 只能往被允许的地方发消息。
 // - 所有调用走 OneBot HTTP API（httpUrl + accessToken）。
 import fs from 'node:fs';
+import os from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import http from 'node:http';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -23,6 +26,114 @@ import { EMOTION_LABELS } from './sticker-semantics.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
+
+// ---- 表情图库（dsh-meme / meme-packs）读取与挑选 ----
+const MEME_TAG_ALIAS = {
+  开心: 'happy', 高兴: 'happy', 卖萌: 'happy', 可爱: 'happy', 喜欢: 'happy',
+  难过: 'sad', 委屈: 'sad', 伤心: 'sad', 无语: 'sad', 求饶: 'sad',
+  生气: 'angry', 气: 'angry', 愤怒: 'angry',
+  害羞: 'shy', 不好意思: 'shy',
+  困惑: 'confused', 疑惑: 'confused', 惊讶: 'surprised', 震惊: 'surprised',
+  日常: 'daily', 睡觉: 'daily', 上班: 'daily', 早上好: 'daily', 摆烂: 'daily',
+  累: 'cpu', 好累: 'cpu', 加班: 'cpu', 崩溃: 'cpu', 干饭: 'daily', 吃饭: 'daily', 饿: 'daily',
+  摸鱼: 'work', 下班: 'work', 躺平: 'work', 困: 'sleep', 晚安: 'sleep', 无语: 'sigh', 嫌弃: 'baka',
+  吃: 'daily', 想吃: 'daily', 饭: 'daily', 零食: 'daily',
+  夸: 'happy', 被夸: 'happy', 点赞: 'happy', 好耶: 'happy', 自信: 'happy',
+  不要: 'fool', 拒绝: 'fool', 不行: 'fool', 摇头: 'fool',
+  钱: 'givemoney', 打赏: 'givemoney', 红包: 'givemoney',
+  震惊: 'see', 哇: 'see', 看到了: 'see',
+  思考: 'confused', 卡: 'confused', 转不动: 'confused', 懵: 'confused',
+  猫: 'meow', 卖萌: 'meow', 可爱: 'meow',
+  比心: 'like', 喜欢: 'like', 花痴: 'color', 心动: 'color',
+  哭: 'sad', 委屈: 'sad', 求饶: 'sad',
+  早上: 'morning', 你好: 'morning', 打招呼: 'morning'
+};
+
+function memePackDirs() {
+  const dirs = [];
+  const cfgDirs = cfg.socialV2?.meme?.dirs;
+  if (Array.isArray(cfgDirs)) for (const d of cfgDirs) dirs.push(path.resolve(String(d)));
+  dirs.push(path.join(os.homedir(), '.dsh', 'meme-packs'));
+  const profile = process.env.DSH_PROFILE_DIR || path.join(os.homedir(), '.dsh', 'profiles', 'desktop');
+  dirs.push(path.join(profile, 'node_modules', 'dsh-meme', 'memes'));
+  return [...new Set(dirs)].filter((d) => { try { return fs.existsSync(d); } catch { return false; } });
+}
+
+let memeCache = null;
+let lastMemePath = '';
+
+function memes() {
+  if (memeCache && Date.now() - memeCache.at < 60_000) return memeCache;
+  const rows = [];
+  for (const packRoot of memePackDirs()) {
+    let subdirs = [];
+    try { subdirs = fs.readdirSync(packRoot, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => path.join(packRoot, d.name)); } catch { continue; }
+    for (const packDir of subdirs) {
+      const db = path.join(packDir, 'index.db');
+      if (!fs.existsSync(db)) continue;
+      try {
+        const conn = new DatabaseSync(db, { readOnly: true });
+        const list = conn.prepare('SELECT path, tag, caption, keywords FROM memes').all();
+        conn.close();
+        for (const r of list) rows.push({ ...r, abs: path.join(packDir, r.path), pack: path.basename(packDir) });
+      } catch { /* 坏库跳过 */ }
+    }
+    // 扁平 index.json（别的图库包格式）
+    const flat = path.join(packRoot, 'index.json');
+    if (fs.existsSync(flat)) {
+      try {
+        const j = JSON.parse(fs.readFileSync(flat, 'utf8'));
+        for (const m of (Array.isArray(j) ? j : (j.memes ?? []))) {
+          if (!m?.path) continue;
+          rows.push({ path: m.path, tag: m.tag ?? '', caption: m.caption ?? '', keywords: m.keywords ?? '', abs: path.resolve(packRoot, m.path), pack: 'flat' });
+        }
+      } catch { /* ignore */ }
+    }
+  }
+  memeCache = { at: Date.now(), rows };
+  return memeCache;
+
+}
+
+function pickMeme(rows, { description, tag } = {}) {
+  if (!rows.length) return null;
+  const descText = String(description ?? '').trim().toLowerCase();
+  const aliasHit = Object.keys(MEME_TAG_ALIAS).filter((k) => descText.includes(k)).sort((a, b) => b.length - a.length)[0];
+  const wantTag = tag ? (MEME_TAG_ALIAS[tag] ?? String(tag).toLowerCase()) : (aliasHit ? MEME_TAG_ALIAS[aliasHit] : '');
+  let pool = wantTag ? rows.filter((r) => String(r.tag ?? '').toLowerCase() === wantTag) : rows.slice();
+  if (!pool.length) pool = rows.slice();
+  const text = String(description ?? '').trim().toLowerCase();
+  if (text) {
+    // 打分：整词命中 > 词组(bigram) 命中 > 单字命中。
+    // 2026-11-10 修：原来「取前 6 名随机」会让「干饭」抽到「摸鱼躺平」（只靠单字「干」得分），
+    // 现在只在「接近最高分」的候选里随机，单字弱匹配不再抢到名额。
+    const grams = [];
+    for (let i = 0; i < text.length - 1; i += 1) grams.push(text.slice(i, i + 2));
+    const scored = pool.map((r) => {
+      const hay = `${r.caption ?? ''} ${r.keywords ?? ''} ${r.tag ?? ''} ${path.basename(String(r.abs))}`.toLowerCase();
+      let s = 0;
+      if (hay.includes(text)) s += 10;
+      for (const g of new Set(grams)) if (g.trim() && hay.includes(g)) s += 4;
+      for (const ch of new Set(text.split(''))) if (ch.trim() && hay.includes(ch)) s += 1;
+      return { r, s };
+    }).filter((x) => x.s > 0).sort((a, b) => b.s - a.s);
+    if (!scored.length) return pickRandom(pool);
+    const best = scored[0].s;
+    // 只在最高分附近取候选（差距 ≤ 2 分），保证同义词之间仍有变化
+    const near = scored.filter((x) => x.s >= best - 2).slice(0, 4).map((x) => x.r);
+    return pickRandom(near);
+  }
+  return pickRandom(pool);
+}
+
+function pickRandom(list) {
+  const fresh = list.filter((r) => r.abs !== lastMemePath);
+  const from = fresh.length ? fresh : list;
+  const picked = from[Math.floor(Math.random() * from.length)];
+  lastMemePath = picked.abs;
+  return picked;
+}
+
 
 function loadConfig() {
   try {
@@ -319,6 +430,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_social_state: 'socialState',
   qq_mark_read: 'markRead',
   qq_close_conversation: 'closeConversation',
+  qq_set_promise: 'setPromise',
   qq_set_wake_config: 'setWakeConfig',
   qq_send_burst: 'sendBurst',
   qq_send_message: 'sendMessage',
@@ -694,6 +806,33 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `收尾失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_set_promise',
+  '登记一个「我几点来找你」的承诺。**只要你在聊天里答应了具体时间点**（今晚十一点半来找你、明天九点喊你起床、23:30 见、我一会儿八点提醒你），就必须在发出那句话的同一轮调用本工具登记一次；不登记就等于没答应——桥接不会读心，它只在你说过之后由这句话反推。登记后桥接会在约定时刻**前 10 分钟内随机挑一刻**叫醒你，让你主动去赴约（不会准点像闹钟）。对方改主意或你不打算去了，用 cancel=true 取消。已经过去的时刻会自动顺延到明天。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    time: z.string().optional().describe('约定时刻，24 小时制 HH:MM，例如 23:30'),
+    text: z.string().optional().describe('当时说的原话或由头（会被带进赴约那次唤醒，最多 200 字）'),
+    cancel: z.boolean().optional().describe('true = 取消这条约定（默认取消最近一条待赴约的；配合 id 精确取消）'),
+    id: z.string().optional().describe('要取消的约定 id（cancel=true 时可选）'),
+    direction: z.enum(['out', 'in']).optional().describe('out=你答应去找对方（默认，提前量内主动来）；in=对方答应来找你（过了约定点还没人来，你主动问一句）'),
+    vague: z.boolean().optional().describe('true=没有具体钟点的「晚点/稍后」（不用传 time）；登记后 1~2 小时内随机，且期间没再聊就主动开口')
+  },
+  async ({ key, token, time, text, cancel, id, direction, vague }) => {
+    try {
+      const data = await agentApi('/api/socialV2/promise', {
+        method: 'POST',
+        body: JSON.stringify({ key, time, text, cancel, id, direction, vague }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `登记约定失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
@@ -1285,6 +1424,86 @@ if (true) {
   );
 
   server.tool(
+    'qq_sing',
+    '现场给对方唱一段：按歌名自动做一首翻唱（B站选歌 → 分离 → 换嗓 → 混音 → 剪 30~50 秒），做好后你再用 qq_send_voice 把文件发出去。触发场景：对方说「点歌」「唱歌」「唱《XX》」「我想听你唱歌」「来一首」之类。对方说「清唱」「不要伴奏」时传 acapella=true（会自动挑副歌段、不加混响）。**默认只要女声独唱**：选歌会排除现场版、合集、对唱合唱、常见男歌手版本，并且只挑 8 分钟以内的单曲；如果这段其实是男女对唱，会返回 code=DUET_DETECTED——这时**先问对方**「这首是对唱，要不要我只唱女声那部分？」，对方说要才传 duet=true 重试，别自己直接做。返回 ok:true 时拿到 file，必须紧接着调用 qq_send_voice(voice=file) —— 别把文件名当文字念。制作有 180 秒硬上限：返回 code=RENDER_TIMEOUT / RENDER_CRASHED / VOICE_SERVICE_OFFLINE / SOURCE_TOO_LONG 时，用你自己的话找个自然的借口拒绝（嗓子哑了 / 今天状态不好 / 这首不太会），不要提服务器或技术原因，也不要承诺「下次一定」。返回 code=MALE_SONG 表示这首歌原唱是男声：直接告诉她「这首原唱是男声，我唱不出那个味道，换一首女声的吧」，不要硬唱男声版。返回 code=SONG_NOT_AVAILABLE 表示网易云没有这首歌的原唱（下架/版权）：直接建议她换一首，**不要**去找 B 站替代版本。返回 code=DUET_DETECTED 表示对唱：先问她要不要只唱女声那部分（要才用 duet=true）。语音条有流控（每分钟 2 条、每小时 30 条）：如果发送返回「语音发送频率超限」，别换方式硬发，就说一句「你等我一会儿/我等下再唱给你听」，稍后再说。制作通常需要 1~3 分钟，不要中途重复调用。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      song: z.string().optional().describe('歌名，如「晴天」「小幸运」；不传就自己挑一首适合她唱的'),
+      seconds: z.number().optional().describe('语音时长（秒）。不传则 30~50 秒随机；传了就夹在 30~50 之间'),
+      acapella: z.boolean().optional().describe('清唱：只要人声、不叠伴奏。对方说「清唱」「不用伴奏」「就唱一段」时用；清唱时 RVC 的瑕疵更明显，适合副歌短段'),
+      full: z.boolean().optional().describe('完整版：生成整首成品（不剪 30~50 秒）。对方明确要「完整版/整首」时才用；返回 full=true，必须改用 qq_send_file 以文件形式发，不能用 qq_send_voice'),
+      duet: z.boolean().optional().describe('对方明确说「对唱版」「只唱女声那部分」时才传 true：走 chorus 模型拆男女声，只换女声、男声保留原唱。默认不传——默认只要女声独唱，遇到对唱会返回 DUET_DETECTED 让你先问对方')
+    },
+    async ({ key, token, song, seconds, acapella, full, duet }) => {
+      const script = path.resolve(ROOT, '..', 'voice-ai', 'client', 'sing-request.mjs');
+      if (!fs.existsSync(script)) {
+        return { content: [{ type: 'text', text: '唱歌功能没装好：找不到 sing-request.mjs' }], isError: true };
+      }
+      const args = [script, '--json'];
+      if (song) args.push('--song', String(song).slice(0, 40));
+      if (seconds) args.push('--seconds', String(Math.min(50, Math.max(30, Math.round(Number(seconds) || 45)))));
+      if (acapella === true) args.push('--acapella');
+      if (full === true) args.push('--full');
+      if (duet === true) args.push('--engine', 'chorus');
+      const r = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 900000, maxBuffer: 8 * 1024 * 1024 });
+      const out = String(r.stdout ?? '').trim().split(/\r?\n/).filter(Boolean).pop() ?? '';
+      let data = null;
+      try { data = JSON.parse(out); } catch {}
+      if (!data) {
+        return { content: [{ type: 'text', text: `唱歌失败（没有有效输出）：${(r.stderr ?? '').slice(-300)}` }], isError: true };
+      }
+      if (!data.ok) {
+        const advice = data.code === 'VOICE_SERVICE_OFFLINE'
+          ? '渲染服务离线。用你自己的话找个自然的借口拒绝唱歌（嗓子哑了 / 今天状态不好 / 麦克风坏了），不要提服务器、不要解释技术原因、不要承诺下次一定。'
+          : (data.hint || '这次没唱成，可以道歉一句就算了');
+        return { content: [{ type: 'text', text: `唱歌失败：code=${data.code} ${data.error ?? ''}\n${advice}` }], isError: true };
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            file: data.file,
+            title: data.title,
+            bv: data.bv,
+            seconds: data.seconds,
+            mb: data.mb,
+            ms: data.ms,
+            next: data.full
+              ? `立即调用 qq_send_file(file="${data.file}", key="${key}", token=...) 以文件形式发出（完整版不能走语音条，语音条有 300 秒/20MB 限制）；发完用你自己的话接一句`
+              : `立刻调用 qq_send_voice(voice="${data.file}", key="${key}", token=...) 把这段语音发出去；发完用你自己的话接一句（不要念文件名、不要报时长）`,
+          }),
+        }],
+      };
+    }
+  );
+
+  server.tool(
+    'qq_send_file',
+    '把语音库里的音频当「QQ 文件」发出去（完整歌曲用这个：语音条有 300 秒/20MB 限制，文件没有）。只能选语音库目录内的文件。对方明确要「完整版/整首/文件」时才用；只想要一段就用 qq_send_voice。发送前建议先接一句「整首发你」。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      file: z.string().describe('语音库里的文件名（来自 qq_list_voices 的 name 或 qq_sing 返回的 file）'),
+      name: z.string().optional().describe('可选：在 QQ 里显示的文件名，默认用原文件名')
+    },
+    async ({ key, token, file, name }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-file', {
+          method: 'POST',
+          body: JSON.stringify({ key, file, name: name || '', token }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 240000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发送文件失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
     'qq_list_voices',
     '查看可用的语音库（qq-bridge 的 audio 目录里准备好的音频文件）：文件名、时长、大小。想发语音前先调用这个看有哪些能发（名字用返回的 name）。返回里 limits 是时长/体积/频率上限。语音库里没有合适内容时不要硬发，也不要假装发了语音。',
     {
@@ -1300,6 +1519,55 @@ if (true) {
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `获取语音库失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+  server.tool(
+    'meme_qq',
+    '给 QQ 里的对方发一张表情包：给一句描述或情绪，插件自己去图库找图，以 QQ「收藏表情」的形式发出去（不是普通图片）。\nQQ 通道不认 [表情: ...] 那种标记，所以要用图就调这个，别再手写标记。\n找不到图时会退回同一情绪/全库，不会报错刷屏。\n另外两个动作：action="reindex" 重建图库索引，action="stats" 看图库有多少张、哪个情绪最多。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      description: z.string().optional().describe('想发什么感觉的表情，比如「哭」「穷光蛋」「累瘫」；也可以直接抄图库里的描述'),
+      tag: z.string().optional().describe('可选情绪：happy / sad / angry / shy / confused / daily（中文说法也认，比如「哭」）'),
+      action: z.enum(['send', 'reindex', 'stats']).optional().describe('默认 send；reindex 重建索引；stats 看统计')
+    },
+    async ({ key, token, description, tag, action }) => {
+      const kind = action ?? 'send';
+      const packs = memePackDirs();
+      if (!packs.length) {
+        return { content: [{ type: 'text', text: '表情图库还没装：先安装 dsh-meme（图库包自带 memes 目录）。' }], isError: true };
+      }
+      if (kind === 'stats') {
+        const rows = memes().rows;
+        const byTag = {};
+        for (const r of rows) byTag[r.tag || 'unknown'] = (byTag[r.tag || 'unknown'] ?? 0) + 1;
+        const top = Object.entries(byTag).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        return { content: [{ type: 'text', text: `图库共 ${rows.length} 张，分布：${top.map(([t, n]) => `${t} ${n}`).join('、')}` }] };
+      }
+      const all = memes();
+      if (kind === 'reindex') {
+        return { content: [{ type: 'text', text: `当前索引已包含 ${all.rows.length} 张（索引由各 pack 的 index.db 汇总，无需手动重建）。` }] };
+      }
+      const picked = pickMeme(all.rows, { description, tag });
+      if (!picked) {
+        return { content: [{ type: 'text', text: '图库里没有匹配的表情，你可以不发图，或者换一句话描述。' }] };
+      }
+      try {
+        const data = await agentApi('/api/socialV2/send-meme', {
+          method: 'POST',
+          body: JSON.stringify({ key, file: picked.abs, token }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ ok: true, sent: true, via: data?.via ?? 'sticker', caption: picked.caption || '', tag: picked.tag || '', file: path.basename(picked.abs), messageId: data?.messageId ?? null, added: data?.added === true })
+          }]
+        };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发图失败：${error?.message ?? error}（可以改用文字回复，别假装发了图）` }], isError: true };
       }
     }
   );
