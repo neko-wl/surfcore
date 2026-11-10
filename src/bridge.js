@@ -15817,8 +15817,10 @@ async function main() {
       createdAt: now
     };
     if (vague) item.fireAt = computeVagueFireAt(now, conf.vagueMinMs, conf.vagueMaxMs);
-    else if (dir === 'in') item.askAt = computeAskFireAt(at, conf.missMs, conf.askWindowMs);
-    else item.fireAt = computePromiseFireAt(at, conf.leadMs);
+    else if (dir === 'in') item.askAt = Math.max(now, computeAskFireAt(at, conf.missMs, conf.askWindowMs));
+    // 登记时如果已经进入提前量窗口（比如 01:31 才登记 01:33 的约定），随机点可能落在过去。
+    // 夹到「现在」，否则日志会打出「将在 01:25 左右唤醒」这种已经过去的时间。
+    else item.fireAt = Math.max(now, computePromiseFireAt(at, conf.leadMs));
 
     list.push(item);
     // 只留最近的若干条，避免 state 无限长。
