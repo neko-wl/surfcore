@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "version": "0.8.8",
   "source": "git:HEAD",
-  "generatedAt": "2026-11-10T17:19:07.877Z",
+  "generatedAt": "2026-11-10T17:19:45.880Z",
   "files": {
     ".gitignore": "df9b778e654706a89497277c5e725dddc5e9e0ab2675e5ff21cda9b7fae476c0",
     ".npmrc": "a093bb2fed59d699b7f9a62a5203cc196054c624e9c39c6d908c9e7db5dd2464",
@@ -620,7 +620,7 @@
     "src/bili-memory.js": "b33160a207162cdcbdacdbaf9b2e2d3f04743754fd2fa34ce20a6b84ec36838a",
     "src/bili-share-scheduler.js": "c0d6941c7b5fa6db5e96be6ae8f17bf4d95b6e85830d3132d75a15b5efc43a56",
     "src/billing-report.js": "aa0699ec2bbab427dfc2ff43f398283f9a35838e6c69adc92038961fe42be6e7",
-    "src/bridge.js": "fa1ec0e5bf53984c75effb2780261af8a51c60612ccdcdb7718329def66d4906",
+    "src/bridge.js": "dcfc7c32ab4911f33fd43dfd2389ad56d80f720d0e9730a50f7253e77c2785ee",
     "src/callname.js": "a3c98a0657caa5799c8a9780394749f4c72e9765136a76a9a944da1c39d43778",
     "src/character-persona.js": "b4c167d35cefbace3dec103bf7976aa29a6586d725bb62ea9604e71322372db2",
     "src/command-spam.js": "6474a9332f9991b5a6547d9b97be966920ef364ea4d60702694ce6d48870255d",
