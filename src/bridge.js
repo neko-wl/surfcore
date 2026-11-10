@@ -10,6 +10,7 @@ import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { computePromiseFireAt, detectPromise, parseHHMM } from './promise-time.mjs';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
@@ -978,6 +979,16 @@ function loadConfig() {
       autoReplyCheckMs: 30000,
       agentPreset: 'qq-chat-v2',
       provideRecommendations: true,
+      // 承诺定时：她在聊天里答应了具体时间，就在 [forAt-leadMs, forAt] 之间随机醒一次去赴约。
+      // 两个入口：工具 qq_set_promise（精确）+ 扫描她发出的消息（兜住「说了但没登记」）。
+      // 背景：主动机会是 30~90 分钟随机 + 概率判定，聊天里那句承诺本来没有任何东西把它变成定时器。
+      promise: {
+        enabled: true,
+        leadMs: 10 * 60 * 1000,
+        graceMs: 30 * 60 * 1000,
+        scanEnabled: true,
+        maxPending: 5
+      },
       tools: {
         getPrompt: true,
 
@@ -1008,7 +1019,8 @@ function loadConfig() {
         stickerNote: true,
         collectSticker: true,
         getSelfImage: true,
-        closeConversation: true
+        closeConversation: true,
+        setPromise: true
       },
       wake: {
         defaultMode: 'diving',
@@ -1844,6 +1856,7 @@ async function main() {
   let purposeStateMtime = 0;
   savePurposeState();
   let purposeTimer = null;
+  let promiseTimer = null;
   let purposeRun = null; // { runId, at, key, sessionId, planned, sentTexts, timer }
   let purposeLastLog = { at: 0, reason: '', nextFireAt: 0 };
 
@@ -3877,6 +3890,8 @@ async function main() {
         if (cfg.purpose?.enabled !== false) {
           try { startPurposeLoop(); } catch (error) { log(`[目的] 启动失败：${error?.message ?? error}`); }
         }
+        // 承诺定时：她说「今晚 11:30 来找你」，到点就得有人把她叫醒去赴约。
+        try { startPromiseLoop(); } catch (error) { log(`[承诺] 启动失败：${error?.message ?? error}`); }
         if (currentMode === 'reserved2') {
           // 首次确定模式为 reserved2 后再恢复持久化的有限睡眠定时器，
           // 避免在 initial chat 模式下设置定时器导致 timeout 唤醒被模式守卫吞掉。
@@ -8166,6 +8181,32 @@ async function main() {
           sendJson({ ok: true, key, file: path.basename(imagePath), via, added, emojiId, messageId, bytes: buffer.length });
           return;
         }
+        // 承诺定时：她自己登记「我几点来找你」。只认 24 小时制 HH:MM；
+        // 传的时间已经过去就顺延到明天（否则 23:31 登记 23:30 会直接算过期）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/promise') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, code: 'promise.missing-key', error: 'key 不能为空（格式 group:群号 或 private:QQ号）', hint: '带上会话 key' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, code: 'promise.mode', error: '该接口仅 reserved2 模式可用', hint: '切到二代仿真模式' }, 403); return; }
+          if (!v2ToolEnabled('setPromise')) { sendJson({ ok: false, code: 'promise.tool-disabled', error: '工具未启用：qq_set_promise', hint: '控制台打开该工具开关' }, 403); return; }
+          if (!token) { sendJson({ ok: false, code: 'promise.missing-token', error: 'reserved2 模式必须携带 agent token', hint: '带上唤醒提示里的会话令牌' }, 403); return; }
+          const consoleOk = (() => { const ct = String(cfg.consoleToken ?? ''); const st = String(req.headers['x-console-token'] ?? '').trim(); return Boolean(ct) && ct === st; })();
+          if (!agentTokenOk(key, token) && !consoleOk) { sendJson({ ok: false, code: 'promise.bad-token', error: 'agent token 无效', hint: '使用唤醒提示中的【会话令牌】' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, code: 'promise.not-allowed', error: '目标不在当前模式允许范围内', hint: '检查 config.json 的 allow 白名单' }, 403); return; }
+          if (body.cancel === true) { sendJson(cancelPromiseV2(key, String(body.id ?? '').trim())); return; }
+          const parsed = parseHHMM(body.time) ?? (body.text ? detectPromise(String(body.text), Date.now()) : null);
+          if (!parsed) { sendJson({ ok: false, code: 'promise.bad-time', error: '时间格式无法识别', hint: '传 24 小时制 HH:MM（例如 23:30），或一句带时间的原话' }, 400); return; }
+          let forAt = Number(parsed.forAt);
+          if (!Number.isFinite(forAt)) {
+            const base = new Date();
+            base.setHours(parsed.hour, parsed.minute, 0, 0);
+            forAt = base.getTime();
+            if (forAt <= Date.now()) forAt += 24 * 60 * 60 * 1000;
+          }
+          sendJson(registerPromiseV2(key, { forAt, text: body.text, source: 'tool' }));
+          return;
+        }
         // 表情图库发图：本地图片 → image 段 → SnowLuma（QQ 通道没有渲染层，只能直接发图）。
         // 安全边界：只允许 meme 图库目录内的文件（防 prompt injection 拿任意本地图片外发）。
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-image') {
@@ -11434,6 +11475,9 @@ async function main() {
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           // 对话收尾记录：只存结论（收在哪 / 下次怎么接）+ 冷却时间，不存额外消息副本。
           closure: st.closure && typeof st.closure === 'object' ? st.closure : undefined,
+          // 定点主动：{ itemId: 'YYYY-MM-DD' | 'missed:YYYY-MM-DD' }，保证同一 item 每天只投递一次。
+          // 承诺定时：pending 条目必须落盘，否则桥接一重启「约好 11:30」就没了。
+          promises: Array.isArray(st.promises) ? st.promises.slice(-20) : undefined,
           // 鱼群保护状态（2026-10-23）：冷却、直呼放行、最近触发记录。
           fishGuard: st.fishGuard && typeof st.fishGuard === 'object' ? st.fishGuard : undefined,
           fishGuardBypass: st.fishGuardBypass && typeof st.fishGuardBypass === 'object' ? st.fishGuardBypass : undefined,
@@ -14316,6 +14360,8 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     // 目的机制：这一发是不是「主动找主人」那一回合里真发出去的；是就记下来，回合结束记 sent。
     try { notePurposeOutbound(key, list); } catch {}
+    // 承诺定时：她说「今晚 11:30 来找你」，就在出站这一刻把约定记进 state（不依赖她记得调工具）。
+    try { notePromiseFromOutbound(key, list); } catch {}
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
@@ -14890,6 +14936,14 @@ async function main() {
     if (reason === 'proactiveCheck') {
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
+    if (String(reason).startsWith('promise:')) {
+      // 赴约：这是她自己答应过的时间点，提示词要让她当成「我自己记着」，别暴露定时器。
+      const promiseId = String(reason).slice('promise:'.length);
+      const p = promisesOf(getSocialV2State(key)).find((x) => x.id === promiseId);
+      const when = p ? clockText(p.forAt) : '';
+      const quote = p?.text ? `\n你当时是这么说的：「${p.text}」` : '';
+      return `${base}【赴约】${key}\n原因：你之前亲口答应过 ${when || '这个点'} 要来找对方，现在到时间了。${quote}\n主动开口，一两句就够，语气自然。不要提「定时」「提醒」「系统」，就当是你自己记着的。`;
+    }
     if (reason === 'history') {
       return `${base}【上线补历史】${key}\n原因：你刚上线，桥接用 QQ 历史记录把离线期间错过的消息补进了未读（消息带 history=true；若本次快照没内联，可调用 qq_get_context_snapshot(include=["unread"]) 查看）。\n先快速扫一遍补上下文；这些是已经发生的旧消息，除非仍然相关，不要逐条回复或引用，也不要当成刚刚发生。看完可以用 qq_mark_read 或 qq_set_wake_config 安静收尾。`;
     }
@@ -14917,7 +14971,7 @@ async function main() {
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
     const stForGuard = getSocialV2State(key);
-    const autoWake = ['proactiveCheck', 'timeout', 'replyCheck', 'history', 'bootstrap'].includes(String(reason));
+    const autoWake = ['proactiveCheck', 'timeout', 'replyCheck', 'history', 'bootstrap', 'scheduled'].includes(String(reason).split(':')[0]);
     const channel = qqSendChannelStatus();
     if (!channel.ok) {
       if (!stForGuard.channelGateLoggedAt || Date.now() - stForGuard.channelGateLoggedAt > 10 * 60 * 1000) {
@@ -15211,7 +15265,7 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导/上线补历史）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'history', 'backlog']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'history', 'backlog', 'promise']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -15653,6 +15707,138 @@ async function main() {
     }, delay);
     st.proactiveTimer.unref?.();
     log(`[reserved2] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
+  }
+
+  function startPromiseLoop() {
+    if (promiseTimer) return;
+    promiseTimer = setInterval(runPromiseTick, 30 * 1000);
+    promiseTimer.unref?.();
+    log('[承诺] 已启动：每 30 秒检查一次待赴的约定');
+    // 启动即看一次：停机期间正好到点的，开机就补。
+    setTimeout(runPromiseTick, 3000).unref?.();
+  }
+
+  // ── 承诺定时（promise）──────────────────────────────────────────────────
+  // 需求：她在聊天里说「今晚 11:30 来找你」，系统就要在 23:20~23:30 之间自己醒一次去赴约。
+  // 两个入口：
+  //   1) 工具 qq_set_promise —— 精确，她自己登记；
+  //   2) 出站扫描 —— 从她发出去的话里认时间，兜住「说了但忘了调工具」。
+  // 为什么必须两个都有：只靠工具，她忘调就整条链断（这就是本次事故的形态）；
+  // 只靠扫描，中文时间表达会误报。合起来：工具优先，扫描补位，同一时刻去重。
+  function promiseConfigV2() {
+    const p = cfg.socialV2?.promise ?? {};
+    return {
+      enabled: p.enabled !== false,
+      leadMs: Math.max(0, Number(p.leadMs ?? 10 * 60 * 1000) || 0),
+      graceMs: Math.max(0, Number(p.graceMs ?? 30 * 60 * 1000) || 0),
+      scanEnabled: p.scanEnabled !== false,
+      maxPending: Math.max(1, Number(p.maxPending ?? 5) || 5)
+    };
+  }
+
+  function promisesOf(st) {
+    if (!Array.isArray(st.promises)) st.promises = [];
+    return st.promises;
+  }
+
+  function clockText(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+
+  function registerPromiseV2(key, { forAt, text, source }) {
+    const conf = promiseConfigV2();
+    if (!conf.enabled) return { ok: false, code: 'promise.disabled', error: '承诺定时已关闭', hint: '在 config.json 的 socialV2.promise.enabled 打开' };
+    const at = Number(forAt);
+    if (!Number.isFinite(at)) return { ok: false, code: 'promise.bad-time', error: '时间无效', hint: '传 HH:MM（24 小时制）' };
+    if (at <= Date.now()) return { ok: false, code: 'promise.past', error: '这个时间点已经过去了', hint: '给一个还没到的时间，或用明天的时刻' };
+
+    const st = getSocialV2State(key);
+    const list = promisesOf(st);
+    // 同一时刻 5 分钟内只留一条：工具登记 + 扫描兜底很容易同时命中同一句话。
+    const dup = list.find((p) => p.status === 'pending' && Math.abs(Number(p.forAt) - at) < 5 * 60 * 1000);
+    if (dup) return { ok: true, duplicated: true, promise: dup };
+
+    const fireAt = computePromiseFireAt(at, conf.leadMs);
+    const item = {
+      id: `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      forAt: at,
+      fireAt,
+      text: String(text ?? '').slice(0, 200),
+      source: source === 'scan' ? 'scan' : 'tool',
+      status: 'pending',
+      createdAt: Date.now()
+    };
+    list.push(item);
+    // 只留最近的若干条，避免 state 无限长。
+    while (list.length > conf.maxPending * 3) list.shift();
+    saveSocialV2State();
+    log(`[承诺] 登记 ${key} 约定 ${clockText(at)}（${item.source}` + `${item.text ? ` · ${item.text.slice(0, 30)}` : ''}）→ 将在 ${clockText(fireAt)} 左右唤醒`);
+    return { ok: true, promise: item };
+  }
+
+  function cancelPromiseV2(key, id) {
+    const st = getSocialV2State(key);
+    const list = promisesOf(st);
+    const target = id ? list.find((p) => p.id === id && p.status === 'pending') : list.find((p) => p.status === 'pending');
+    if (!target) return { ok: false, code: 'promise.not-found', error: '没有待赴的约定', hint: '可能已经过了或已被取消' };
+    target.status = 'cancelled';
+    saveSocialV2State();
+    log(`[承诺] 取消 ${key} 约定 ${clockText(target.forAt)}`);
+    return { ok: true, promise: target };
+  }
+
+  function runPromiseTick() {
+    const conf = promiseConfigV2();
+    if (!conf.enabled) return;
+    const now = Date.now();
+    for (const [key, st] of socialV2.conversations) {
+      const list = promisesOf(st);
+      let dirty = false;
+      for (const p of list) {
+        if (!p || p.status !== 'pending') continue;
+        if (now > Number(p.forAt) + conf.graceMs) {
+          p.status = 'missed';
+          dirty = true;
+          log(`[承诺] 错过 ${key} 约定 ${clockText(p.forAt)}：超过补发窗口，今天不再赴约`);
+          continue;
+        }
+        if (now < Number(p.fireAt)) continue;
+        p.status = 'fired';
+        p.firedAt = now;
+        dirty = true;
+        log(`[承诺] 到点赴约 ${key}：约定 ${clockText(p.forAt)}（${p.source}），现在 ${clockText(now)} 叫醒`);
+        appendActivity(`${key} [承诺] 赴约 ${clockText(p.forAt)}`);
+        void sendWakePromptV2(key, `promise:${p.id}`).catch((error) => {
+          const message = String(error?.message ?? error).slice(0, 200);
+          log(`[承诺] 唤醒异常 ${key}：${message}`);
+          try {
+            st.lastPromiseError = { at: Date.now(), key, id: p.id, error: message, hint: '检查桥接日志 [channel-gate] / 模式 / 唤醒暂停状态' };
+            saveSocialV2State();
+          } catch {}
+        });
+      }
+      // 一天前已经结束的条目清掉，只留状态机里还有意义的。
+      const before = list.length;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const p = list[i];
+        if (p && p.status !== 'pending' && now - Number(p.forAt) > 24 * 60 * 60 * 1000) { list.splice(i, 1); dirty = true; }
+      }
+      if (dirty || list.length !== before) saveSocialV2State();
+    }
+  }
+
+  /** 出站扫描：她刚发出去的话里如果带了「几点见」，就登记一条。 */
+  function notePromiseFromOutbound(key, messages) {
+    const conf = promiseConfigV2();
+    if (!conf.enabled || !conf.scanEnabled) return;
+    const now = Date.now();
+    for (const raw of Array.isArray(messages) ? messages : []) {
+      const hit = detectPromise(String(raw ?? ''), now);
+      if (!hit) continue;
+      const res = registerPromiseV2(key, { forAt: hit.forAt, text: hit.raw, source: 'scan' });
+      if (res?.ok && !res.duplicated) appendActivity(`${key} [承诺] 从发言里认出约定 ${clockText(hit.forAt)}`);
+    }
   }
 
   function clearSocialV2Timers(key) {

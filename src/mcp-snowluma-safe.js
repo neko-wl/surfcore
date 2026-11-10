@@ -430,6 +430,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_social_state: 'socialState',
   qq_mark_read: 'markRead',
   qq_close_conversation: 'closeConversation',
+  qq_set_promise: 'setPromise',
   qq_set_wake_config: 'setWakeConfig',
   qq_send_burst: 'sendBurst',
   qq_send_message: 'sendMessage',
@@ -805,6 +806,31 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `收尾失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_set_promise',
+  '登记一个「我几点来找你」的承诺。**只要你在聊天里答应了具体时间点**（今晚十一点半来找你、明天九点喊你起床、23:30 见、我一会儿八点提醒你），就必须在发出那句话的同一轮调用本工具登记一次；不登记就等于没答应——桥接不会读心，它只在你说过之后由这句话反推。登记后桥接会在约定时刻**前 10 分钟内随机挑一刻**叫醒你，让你主动去赴约（不会准点像闹钟）。对方改主意或你不打算去了，用 cancel=true 取消。已经过去的时刻会自动顺延到明天。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    time: z.string().optional().describe('约定时刻，24 小时制 HH:MM，例如 23:30'),
+    text: z.string().optional().describe('当时说的原话或由头（会被带进赴约那次唤醒，最多 200 字）'),
+    cancel: z.boolean().optional().describe('true = 取消这条约定（默认取消最近一条待赴约的；配合 id 精确取消）'),
+    id: z.string().optional().describe('要取消的约定 id（cancel=true 时可选）')
+  },
+  async ({ key, token, time, text, cancel, id }) => {
+    try {
+      const data = await agentApi('/api/socialV2/promise', {
+        method: 'POST',
+        body: JSON.stringify({ key, time, text, cancel, id }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `登记约定失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

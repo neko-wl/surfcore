@@ -17,6 +17,39 @@
 > **2026-11-03 04:05：v0.8.7 已发布**，覆盖本表截至该时间的全部待发布批次（0.8.6 以来全部 dev，74 commits）。
 > 以下批次保留作追溯；后续新批次继续加在最上面。
 
+### 批次 2026-11-11 01:05 · QQ 承诺定时（她说了几点就按时来）
+
+<!-- release-batch: start=2026-11-11T00:10+08:00 end=2026-11-11T01:05+08:00 commits=feat/proactive-timer -->
+
+**覆盖提交**：`feat/proactive-timer`（含已废弃的 `scheduledProactive` 的拆除，见下方「回滚」）
+**建议**：**0.9.1（patch）** —— 新增一个 MCP 工具 + 一条主动通道，默认开启但只在出现约定时才动作
+
+**改了什么**：
+- `src/promise-time.mjs`（新增）：`parseChineseNumber` / `parseClockTime` / `detectPromise` /
+  `computePromiseFireAt` / `parseHHMM`。
+- `src/bridge.js`
+  - 新增 `socialV2.promise` 默认块 + `tools.setPromise`；
+  - 新增 `registerPromiseV2` / `cancelPromiseV2` / `runPromiseTick` / `notePromiseFromOutbound`；
+  - `recordSentMessagesV2` 里挂出站扫描（工具没调也能兜住）；
+  - 30 秒心跳同时驱动定点主动与承诺定时；
+  - 新增 `POST /api/socialV2/promise` 与【赴约】唤醒提示词分支（`promise:<id>`）；
+  - `saveSocialV2State` 白名单新增 `promises`。
+- `src/mcp-snowluma-safe.js`：新增工具 `qq_set_promise` + `TOOL_CONFIG_FLAGS.setPromise`。
+- `config.example.json`：新增 `socialV2.promise` 示例。
+- `scripts/audit-bridge-harness.mjs`：注入 promise-time、导出 5 个函数。
+- `scripts/test-qq-promise.mjs`（新增）：13 个用例。
+
+**case**：`docs/cases/2026-11-11-qq-promise.md` · PITFALLS #128
+
+**验证**：
+- `node scripts/test-qq-promise.mjs` → 13/13
+- `node scripts/test-scheduled-proactive.mjs` → 7/7
+- `node scripts/test-audit-regressions.mjs` → 全部通过
+
+**回滚**：`socialV2.promise.enabled = false` 并重启桥接。
+
+**注意（交接）**：这是**新工具**，DSH 侧必须重启才会重新读取工具清单；只重启桥接不够。
+
 ### 批次 2026-11-10 17:00 · QQ 表情（收藏表情呈现）
 
 <!-- release-batch: start=2026-11-10T16:00+08:00 end=2026-11-10T17:00+08:00 commits=uncommitted -->

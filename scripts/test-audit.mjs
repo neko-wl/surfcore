@@ -8,6 +8,8 @@ const tests = [
   'test-audit-bridge.mjs', 'test-audit-protocol.mjs', 'test-audit-protocol-helpers.mjs',
   'test-audit-security.mjs', 'test-audit-security-mcp.mjs',
   'test-audit-setup.mjs', 'test-audit-setup-guards.mjs',
+  // 定点主动 + 承诺定时：到点必发、同日幂等、错过留痕；中文时间解析（十一点半/晚上八点/一点歧义）。
+  'test-qq-promise.mjs',
   // QQ scoped 工具：晚注册的全局危险工具也要补装 Schema 限制。
   'test-qq-tool-restrict-events.mjs',
   // DSH Desktop 安装目录里的 node 解析；bridge/scheduler/setup 共用同一个入口。
