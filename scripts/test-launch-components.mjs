@@ -39,4 +39,12 @@ for (const text of ['一键启动 SurfCore', '一键停止（全部）', 'voiceB
 assert.ok(client.includes('launchErr'), '启动失败必须显示在界面上');
 assert.ok(client.includes('it.hint'), '失败项必须展示下一步建议');
 
+// 2026-11-11 真机事故：插件宿主是 Electron，process.execPath 指向 DeepSeek Harness.exe。
+// 拿它去跑 SnowLuma 的 index.mjs，SnowLuma 会静默起不来（先弹「你要打开此文件吗」，
+// 点完还是没起来）。必须解析出真正的 node —— 优先用 SnowLuma 自带的 node.exe。
+assert.ok(!/spawn\(process\.execPath/.test(index), '不能用 process.execPath 当 node 去 spawn SnowLuma');
+assert.ok(!/target = `"\$\{process\.execPath\}"/.test(index), 'VBS 启动目标里不能用 process.execPath');
+assert.ok(index.includes('resolveSnowLumaNode'), '必须有统一的 node 解析函数');
+assert.ok(index.includes("path.join(appDir, 'node.exe')"), '必须能找到 SnowLuma 自带的 node.exe');
+
 console.log('✅ 一键启动/停止接线通过');
