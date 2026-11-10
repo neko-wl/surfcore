@@ -2359,6 +2359,36 @@ async function main() {
    * 只**检查**不占额度：额度在真正发出去之后才由 voiceBudgetCommit 记账 ——
    * 这样参数错、被审计拦截、网关失败都不会白白吃掉配额（否则连失败几次就被假 429 卡住）。
    */
+  /**
+   * 表情图库图片解析（安全边界）：只允许 meme 图库目录内的文件。
+   *
+   * 为什么单独一条边界：send-image 是把本地图片编码成 base64 发出去，
+   * 如果接受任意路径，等于给了「读任意文件并外发」的通道。
+   * 允许的根：$DSH_HOME/meme-packs、配置 socialV2.meme.dir，以及 dsh-meme 自带的
+   * node_modules/dsh-meme/memes（自带 pack 就在那里）。
+   */
+  function resolveMemeImagePathForOperator(input) {
+    const raw = String(input ?? '').trim();
+    if (!raw) throw new Error('缺少图片：给图库里的图片路径或文件名');
+    if (/^(https?:|base64:|data:)/i.test(raw)) throw new Error('只接受本地图库文件，不接受 URL/base64');
+    const abs = path.resolve(raw);
+    let real;
+    try { real = fs.realpathSync(abs); } catch { throw new Error('文件不存在'); }
+    let st;
+    try { st = fs.statSync(real); } catch { throw new Error('文件读不到'); }
+    if (!st.isFile()) throw new Error('不是文件');
+    if (!/\.(png|jpe?g|gif|webp)$/i.test(real)) throw new Error('只支持 png/jpg/gif/webp');
+    const home = os.homedir();
+    const roots = [
+      path.join(home, '.dsh', 'meme-packs'),
+      cfg.socialV2?.meme?.dir ? path.resolve(String(cfg.socialV2.meme.dir)) : null,
+    ].filter(Boolean).map((r) => { try { return fs.realpathSync(r); } catch { return r; } });
+    const inRoots = roots.some((root) => real === root || real.startsWith(root + path.sep));
+    const inBundledPack = real.split(path.sep).join('/').includes('/node_modules/dsh-meme/memes/');
+    if (!inRoots && !inBundledPack) throw new Error('只允许发送表情图库目录内的图片');
+    return real;
+  }
+
   function voiceBudgetCheck(scopeKey, cfgV) {
     const now = Date.now();
     const bucket = voiceSendTimes.get(scopeKey) ?? [];
@@ -7991,6 +8021,207 @@ async function main() {
             saveSocialV2State();
             log(`[sticker] AI 收藏表情失败 ${key}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `收藏表情失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // 文件发送：把语音库里的文件当作「QQ 文件」发出去。
+        // 用途：完整歌曲（语音条有 300 秒 / 20MB 限制，文件没有）。
+        // 安全：只允许语音库目录内的文件（resolveVoicePathForOperator 会拒绝目录外路径）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-file') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const km = /^(group|private):(\d+)$/.exec(key);
+          if (!km) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          let resolved;
+          try {
+            resolved = resolveVoicePathForOperator(body.file ?? body.name ?? '');
+          } catch (error) {
+            sendJson({ ok: false, error: `文件不可用：${error?.message ?? error}` }, 400);
+            return;
+          }
+          const name = String(body.name ?? '').trim() || path.basename(resolved.path);
+          let size = 0;
+          try { size = fs.statSync(resolved.path).size; } catch { sendJson({ ok: false, error: '文件读不到' }, 400); return; }
+          if (size > 200 * 1024 * 1024) {
+            sendJson({ ok: false, error: `文件太大（${(size / 1048576).toFixed(0)}MB > 200MB）`, hint: '先压缩或切段再发' }, 413);
+            return;
+          }
+          const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          const action = km[1] === 'private' ? 'upload_private_file' : 'upload_group_file';
+          const params = km[1] === 'private'
+            ? { user_id: Number(km[2]), file: resolved.path, name }
+            : { group_id: Number(km[2]), file: resolved.path, name };
+          try {
+            const res = await fetch(`${httpUrl}/${action}`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+              },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(120000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) {
+              throw new Error(`OneBot ${action} 失败：${rb.wording || rb.retcode || res.status}`);
+            }
+            log(`[file] ${key} 已发送文件 ${name} (${(size / 1048576).toFixed(1)}MB)`);
+            appendActivity(`${key} [file] 发送文件 ${name} (${(size / 1048576).toFixed(1)}MB)`);
+            sendJson({ ok: true, key, file: path.basename(resolved.path), name, bytes: size, detail: `${(size / 1048576).toFixed(1)}MB`, onebot: rb.data ?? {} });
+          } catch (error) {
+            log(`[file] 发送失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `发送文件失败：${error?.message ?? error}`, hint: 'SnowLuma 的 upload_private_file / upload_group_file 可能不可用，可改用语音条' }, 502);
+          }
+          return;
+        }
+        // 表情图库 → QQ 收藏表情（sticker 呈现）：先 add_custom_face 收进账号收藏，再 send_custom_face 发出去。
+        // 为什么不用 image 段：image 在 QQ 里显示成「图片」（带边框、可点开），收藏表情才是表情面板那种。
+        // 同一张图只收藏一次（按 sha256 缓存 emoji_id），避免把收藏夹刷满。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-meme') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          const consoleOk = (() => { const ct = String(cfg.consoleToken ?? ''); const st = String(req.headers['x-console-token'] ?? '').trim(); return Boolean(ct) && ct === st; })();
+          if (!agentTokenOk(key, token) && !consoleOk) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const km = /^(group|private):(\d+)$/.exec(key);
+          if (!km) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          let imagePath;
+          try {
+            imagePath = resolveMemeImagePathForOperator(body.file ?? '');
+          } catch (error) {
+            sendJson({ ok: false, error: `图片不可用：${error?.message ?? error}` }, 400);
+            return;
+          }
+          let buffer;
+          try { buffer = fs.readFileSync(imagePath); } catch (error) { sendJson({ ok: false, error: `读取图片失败：${error?.message ?? error}` }, 500); return; }
+          if (buffer.length > 8 * 1024 * 1024) { sendJson({ ok: false, error: `图片太大（${(buffer.length / 1048576).toFixed(1)}MB > 8MB）` }, 413); return; }
+          const sha = crypto.createHash('sha256').update(buffer).digest('hex');
+          const cacheFile = path.join(ROOT, 'state', 'meme-favorites.json');
+          let cache = {};
+          try { cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch { cache = {}; }
+          let emojiId = String(cache[sha] ?? '').trim();
+          let added = false;
+          if (!emojiId) {
+            try {
+              const addRes = await bot.request('add_custom_face', { file: 'base64://' + buffer.toString('base64') });
+              if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
+                throw new Error(addRes?.wording || addRes?.retcode || 'unknown');
+              }
+              emojiId = String(addRes.data?.emoji_id ?? '').trim();
+              if (!emojiId) throw new Error('未返回 emoji_id');
+              cache[sha] = emojiId;
+              added = true;
+              try { fs.mkdirSync(path.dirname(cacheFile), { recursive: true }); fs.writeFileSync(cacheFile, JSON.stringify(cache, null, 2)); } catch {}
+            } catch (error) {
+              log(`[meme] add_custom_face 失败，回退发普通图片：${error?.message ?? error}`);
+              emojiId = '';
+            }
+          }
+          let messageId = null;
+          let via = 'sticker';
+          if (emojiId) {
+            try {
+              const params = km[1] === 'private' ? { user_id: Number(km[2]), emoji_id: emojiId } : { group_id: Number(km[2]), emoji_id: emojiId };
+              const sendRes = await bot.request('send_custom_face', params);
+              if (!sendRes || sendRes.status !== 'ok' || sendRes.retcode !== 0) throw new Error(sendRes?.wording || sendRes?.retcode || 'unknown');
+              messageId = sendRes.data?.message_id ?? null;
+            } catch (error) {
+              log(`[meme] send_custom_face 失败，回退发普通图片：${error?.message ?? error}`);
+              emojiId = '';
+            }
+          }
+          if (!emojiId) {
+            // 回退：收藏接口不可用时仍然发图，不让表情功能整体失效。
+            via = 'image';
+            const segments = [{ type: 'image', data: { file: 'base64://' + buffer.toString('base64') } }];
+            const action = km[1] === 'private' ? 'send_private_msg' : 'send_group_msg';
+            const params = km[1] === 'private' ? { user_id: Number(km[2]), message: segments } : { group_id: Number(km[2]), message: segments };
+            try {
+              const res = await fetch(`${String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '')}/${action}`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+                body: JSON.stringify(params),
+                signal: AbortSignal.timeout(60000)
+              });
+              const rb = await res.json().catch(() => ({}));
+              if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) throw new Error(rb.wording || rb.retcode || res.status);
+              messageId = rb.data?.message_id ?? null;
+            } catch (error) {
+              sendJson({ ok: false, error: `发送表情失败：${error?.message ?? error}` }, 502);
+              return;
+            }
+          }
+          log(`[meme] ${key} ${via === 'sticker' ? '收藏表情' : '图片'} ${path.basename(imagePath)} (${(buffer.length / 1024).toFixed(0)}KB)${added ? ' [新收藏]' : ''}`);
+          appendActivity(`${key} [meme] 发送表情 ${path.basename(imagePath)}`);
+          sendJson({ ok: true, key, file: path.basename(imagePath), via, added, emojiId, messageId, bytes: buffer.length });
+          return;
+        }
+        // 表情图库发图：本地图片 → image 段 → SnowLuma（QQ 通道没有渲染层，只能直接发图）。
+        // 安全边界：只允许 meme 图库目录内的文件（防 prompt injection 拿任意本地图片外发）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-image') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          const consoleOk = (() => { const ct = String(cfg.consoleToken ?? ''); const st = String(req.headers['x-console-token'] ?? '').trim(); return Boolean(ct) && ct === st; })();
+          if (!agentTokenOk(key, token) && !consoleOk) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const km = /^(group|private):(\d+)$/.exec(key);
+          if (!km) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          let imagePath;
+          try {
+            imagePath = resolveMemeImagePathForOperator(body.file ?? '');
+          } catch (error) {
+            sendJson({ ok: false, error: `图片不可用：${error?.message ?? error}` }, 400);
+            return;
+          }
+          let size = 0;
+          try { size = fs.statSync(imagePath).size; } catch { sendJson({ ok: false, error: '图片读不到' }, 400); return; }
+          if (size > 8 * 1024 * 1024) { sendJson({ ok: false, error: `图片太大（${(size / 1048576).toFixed(1)}MB > 8MB）` }, 413); return; }
+          let buffer;
+          try { buffer = fs.readFileSync(imagePath); } catch (error) { sendJson({ ok: false, error: `读取图片失败：${error?.message ?? error}` }, 500); return; }
+          const segments = [];
+          if (body.replyToMessageId !== undefined && body.replyToMessageId !== null && String(body.replyToMessageId).trim() !== '') {
+            const rid = String(body.replyToMessageId).trim();
+            if (!/^-?[1-9]\d*$/.test(rid)) { sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数' }, 400); return; }
+            segments.push({ type: 'reply', data: { id: rid } });
+          }
+          segments.push({ type: 'image', data: { file: 'base64://' + buffer.toString('base64') } });
+          const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          const action = km[1] === 'private' ? 'send_private_msg' : 'send_group_msg';
+          const params = km[1] === 'private' ? { user_id: Number(km[2]), message: segments } : { group_id: Number(km[2]), message: segments };
+          try {
+            const res = await fetch(`${httpUrl}/${action}`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+              },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(60000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) {
+              throw new Error(`OneBot ${action} 失败：${rb.wording || rb.retcode || res.status}`);
+            }
+            log(`[meme] ${key} 已发送图片 ${path.basename(imagePath)} (${(size / 1024).toFixed(0)}KB)`);
+            appendActivity(`${key} [meme] 发送表情 ${path.basename(imagePath)}`);
+            sendJson({ ok: true, key, file: path.basename(imagePath), bytes: size, messageId: rb.data?.message_id ?? null });
+          } catch (error) {
+            log(`[meme] 发送失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `发送图片失败：${error?.message ?? error}` }, 502);
           }
           return;
         }
