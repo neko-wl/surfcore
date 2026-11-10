@@ -15842,7 +15842,8 @@ async function main() {
     if (!target) return { ok: false, code: 'promise.not-found', error: '没有待赴的约定', hint: '可能已经过了或已被取消' };
     target.status = 'cancelled';
     saveSocialV2State();
-    log(`[承诺] 取消 ${key} 约定 ${clockText(target.forAt)}`);
+    // 模糊承诺没有 forAt，直接 clockText(null) 会打出 epoch（08:00），别让日志撒谎。
+    log(`[承诺] 取消 ${key} ${target.forAt ? `约定 ${clockText(target.forAt)}` : '模糊约定'}`);
     return { ok: true, promise: target };
   }
 
