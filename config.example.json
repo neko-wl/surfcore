@@ -354,7 +354,9 @@
       "maxPending": 5,
       "missMs": 600000,
       "askWindowMs": 600000,
-      "noshowGraceMs": 7200000
+      "noshowGraceMs": 7200000,
+      "vagueMinMs": 3600000,
+      "vagueMaxMs": 7200000
     },
     "feedback": {
       "maxLength": 500,
