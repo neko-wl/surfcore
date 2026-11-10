@@ -15936,10 +15936,11 @@ async function main() {
         firePromiseWake(key, st, p, 'promise');
       }
       // 一天前已经结束的条目清掉，只留状态机里还有意义的。
+      // 模糊承诺没有 forAt，得回落到 createdAt —— 否则 `now - null` 恒大于 24h，刚结束就被清掉。
       const before = list.length;
       for (let i = list.length - 1; i >= 0; i--) {
         const p = list[i];
-        if (p && p.status !== 'pending' && now - Number(p.forAt) > 24 * 60 * 60 * 1000) { list.splice(i, 1); dirty = true; }
+        if (p && p.status !== 'pending' && now - Number(p.forAt || p.createdAt) > 24 * 60 * 60 * 1000) { list.splice(i, 1); dirty = true; }
       }
       if (dirty || list.length !== before) saveSocialV2State();
     }
