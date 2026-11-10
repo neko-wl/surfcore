@@ -28,7 +28,7 @@ assert.ok(index.includes('hideConsoles') && client.includes('隐藏启动后的�
 assert.ok(index.includes('nodePathEnv'), 'SnowLuma 启动脚本必须能找到 node（不依赖系统 PATH）');
 assert.ok(index.includes("['config', 'runtime.json']") && index.includes('cfg.webuiPort') && client.includes('snowluma.webuiPort'), 'SnowLuma WebUI 端口必须读 config/runtime.json，并支持显式覆盖');
 assert.ok(client.includes('读不到 SnowLuma 控制台') && client.includes('和 QQ 有没有启动无关'), '账号弹窗不能把控制台错误误报成 QQ 没启动');
-assert.ok(index.includes('spawnSnowLumaDetached') && index.includes('WScript.Shell') && index.includes('explorer+vbs'), 'SnowLuma 默认必须隐藏并脱离 DSH 进程树');
+assert.ok(index.includes('spawnSnowLumaDetached') && index.includes('WScript.Shell') && index.includes('wscript+vbs'), 'SnowLuma 默认必须隐藏并脱离 DSH 进程树（走 VBS + wscript）');
 assert.ok(client.includes('snowluma.launchMode'), '设置页必须能切回 legacy 启动方式');
 assert.ok(index.includes("'stop-snowluma'") && index.includes('stopSnowLuma'), '孤儿 SnowLuma 必须能在插件里关闭');
 assert.ok(client.includes('关闭 SnowLuma'), 'SnowLuma 设置卡必须有「关闭 SnowLuma」按钮');
@@ -46,5 +46,11 @@ assert.ok(!/spawn\(process\.execPath/.test(index), '不能用 process.execPath �
 assert.ok(!/target = `"\$\{process\.execPath\}"/.test(index), 'VBS 启动目标里不能用 process.execPath');
 assert.ok(index.includes('resolveSnowLumaNode'), '必须有统一的 node 解析函数');
 assert.ok(index.includes("path.join(appDir, 'node.exe')"), '必须能找到 SnowLuma 自带的 node.exe');
+// 2026-11-11 第二轮真机：用 windowsHide 创建「没有控制台」的父进程后，SnowLuma 自己 spawn 的
+// 子进程会被 Windows 分配一个可见控制台（黑框）。必须走 VBS + window style 0（隐藏但存在
+// 的控制台），且用 wscript 执行——用 explorer 打开 .vbs 会弹「你要打开此文件吗？」。
+assert.ok(index.includes('wscript+vbs'), 'VBS 必须由 wscript 执行并回报 method');
+assert.ok(index.includes("'System32', 'wscript.exe'"), '必须显式解析 wscript.exe 路径');
+assert.ok(!/spawn\(explorer, \[vbsPath\]/.test(index), '不要再用 explorer 打开 VBS（会弹确认框）');
 
 console.log('✅ 一键启动/停止接线通过');
