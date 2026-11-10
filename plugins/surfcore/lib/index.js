@@ -2123,7 +2123,10 @@ ${body}`;
   function nodePathEnv() {
     const env = { ...process.env };
     try {
-      const nodeDir = path.dirname(process.execPath);
+      // 宿主是 Electron 时 execPath 指向 DeepSeek Harness.exe，目录里没有 node；
+      // 只有确认 execPath 本身就是 node 才把它的目录塞进 PATH，否则会往 PATH 里加一个无用目录。
+      const isNode = /^node(\.exe)?$/i.test(path.basename(process.execPath));
+      const nodeDir = isNode ? path.dirname(process.execPath) : '';
       const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'Path';
       const current = String(env[pathKey] ?? '');
       if (nodeDir && !current.split(path.delimiter).includes(nodeDir)) {
@@ -2381,14 +2384,34 @@ ${body}`;
     return { state: 'not-running', hint: 'SnowLuma 没在运行：设置 → SurfCore → 概览 → 一键启动（会按需打开控制台）' };
   }
 
+  // 找一个**真正的 node** 来跑 SnowLuma 的 index.mjs。
+  // 为什么不能直接用 process.execPath：DSH 宿主是 Electron，execPath 指向
+  // `DeepSeek Harness.exe`；拿它去跑 index.mjs 等于让 Electron 把自己当 node，
+  // SnowLuma 静默起不来（2026-11-11 真机：一键启动报「SnowLuma 未打开」，且看不出原因）。
+  // 优先用 SnowLuma 自带的 node.exe（launcher.bat 用的就是它），版本由 SnowLuma 自己保证。
+  function resolveSnowLumaNode(appDir = '') {
+    const cfg = readQqConfig().config?.snowluma ?? {};
+    const explicit = String(cfg.nodePath ?? '').trim();
+    if (explicit && fs.existsSync(explicit)) return explicit;
+    if (appDir) {
+      const bundled = path.join(appDir, 'node.exe');
+      if (fs.existsSync(bundled)) return bundled;
+    }
+    // 宿主本身就是 node（CLI 启动）时可以直接用；否则返回空串，让调用方回落到 launcher.bat。
+    return /^node(\.exe)?$/i.test(path.basename(process.execPath)) ? process.execPath : '';
+  }
+
   /**
    * 2026-11-06 事故：SnowLuma 是插件 spawn 出来的子进程，DSH 退出（每次更新都会退出）时会被
    * 一起结束；而 `cmd /c start` 还会留一个黑框——用户关掉黑框就等于关掉 QQ 网关。
    *
-   * 做法（真机验证过，1 秒拉起）：
+   * 做法：
    *   写一个 VBS（`sh.Run ..., 0, False` = 隐藏窗口）
-   *   → 用 explorer.exe 打开它（explorer 不属于 DSH 的 Job，天然的脱离点）
-   *   → wscript 退出后 node 变成孤儿进程，taskkill /T DSH 也带不走它。
+   *   → 用 wscript.exe 直接执行它（不再用 explorer：explorer 打开 .vbs 会弹
+   *     「你要打开此文件吗？」，2026-11-11 真机）
+   *   → wscript 退出后 node 变成孤儿进程，taskkill /T DSH 也带不走它；
+   *     而它的控制台是「隐藏但存在」的，自己再 spawn 子进程时子进程继承这个隐藏控制台，
+   *     不会各自冒出黑框（这正是 windowsHide 创建「无控制台」父进程时做不到的）。
    * 失败时返回 ok:false，调用方回退旧逻辑（保持原有行为不变）。
    */
   function spawnSnowLumaDetached({ launcher, cwd, env }) {
@@ -2402,9 +2425,11 @@ ${body}`;
       const lower = launcher.toLowerCase();
       const isBatch = lower.endsWith('.bat') || lower.endsWith('.cmd');
       let target;
-      if (isBatch && fs.existsSync(entry)) {
-        // 直接起 node：绕开 launcher.bat 里的 cmd 窗口和末尾的 pause
-        target = `"${process.execPath}" "${entry}"`;
+      const nodeExe = resolveSnowLumaNode(appDir);
+      if (isBatch && fs.existsSync(entry) && nodeExe) {
+        // 直接起 node：绕开 launcher.bat 里的 cmd 窗口和末尾的 pause。
+        // 用解析出来的真 node，不能用 process.execPath（那是 Electron）。
+        target = `"${nodeExe}" "${entry}"`;
       } else if (isBatch) {
         target = `"${process.env.ComSpec || 'cmd.exe'}" /d /c ""${launcher}""`;
       } else {
@@ -2416,15 +2441,21 @@ ${body}`;
       const vbsPath = path.join(stateDir, 'snowluma-launch.vbs');
       fs.writeFileSync(vbsPath, [
         "' 由 SurfCore 生成：隐藏窗口（样式 0）启动 SnowLuma，避免留黑框",
-        "' explorer.exe 打开本文件 → wscript 退出后 node 成为孤儿进程，脱离 DSH 进程树",
+        "' wscript 以隐藏窗口跑本文件 → 子进程继承一个「存在的隐藏控制台」，",
         'Set sh = CreateObject("WScript.Shell")',
         `sh.CurrentDirectory = "${vbsEsc(cwd)}"`,
         `sh.Run "${vbsEsc(target)}", 0, False`,
         '',
       ].join('\r\n'), 'utf8');
-      const explorer = path.join(process.env.SystemRoot || 'C:\\Windows', 'explorer.exe');
-      spawn(explorer, [vbsPath], { detached: true, stdio: 'ignore', env, windowsHide: true }).unref();
-      return { ok: true, method: 'explorer+vbs' };
+      // 用 wscript 直接跑 VBS，不要用 explorer：
+      // 1) explorer 打开 .vbs 会弹「你要打开此文件吗？」（2026-11-11 真机）；
+      // 2) VBS 的 window style 0 会创建一个**隐藏但存在**的控制台，SnowLuma 自己再
+      //    spawn 子进程时继承它，就不会各自冒出一个黑框。
+      //    反例：用 windowsHide 创建「完全没有控制台」的父进程，它的子进程会被 Windows
+      //    分配全新的可见控制台 —— 这就是黑框的来源（13232 无窗口，其子 8488 有窗口）。
+      const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
+      spawn(wscript, [vbsPath], { detached: true, stdio: 'ignore', env, windowsHide: true }).unref();
+      return { ok: true, method: 'wscript+vbs' };
     } catch (error) {
       return { ok: false, error: String(error?.message ?? error) };
     }
@@ -2479,15 +2510,13 @@ ${body}`;
         // 现在整条路径作为「verbatim 参数」交给 cmd，并且拒绝含引号/换行的路径。
         if (/["\r\n]/.test(launcher)) return { ok: false, error: '启动脚本路径含引号或换行，拒绝执行' };
         if (hideConsoles) {
-          // 不经过 `start`：start 会显式创建新控制台窗口，windowsHide 压不住。
-          // SnowLuma 的 launcher.bat 最终也是 `node ./index.mjs`；直接起 node，
-          // 完全绕开 cmd/Windows Terminal 标签。
-          const appDir = path.dirname(launcher);
-          const entry = path.join(appDir, 'index.mjs');
-          if (fs.existsSync(entry)) {
-            spawn(process.execPath, [entry], {
-              cwd: appDir, detached: true, stdio: 'ignore', env: nodePathEnv(), windowsHide: true,
-            }).unref();
+          // 不用 `spawn(node, {windowsHide:true})`：那样父进程「完全没有控制台」，
+          // SnowLuma 自己再 spawn 子进程时 Windows 会分配一个**可见**的新控制台 → 黑框。
+          // 走 VBS + wscript（window style 0）能拿到一个「隐藏但存在」的控制台，
+          // 子进程继承它就不会各自弹窗。
+          const detached = spawnSnowLumaDetached({ launcher, cwd, env: nodePathEnv() });
+          if (detached.ok) {
+            launchedBy = detached.method;
           } else {
             spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/c', `"${launcher}"`], {
               cwd, detached: false, stdio: 'ignore', env: nodePathEnv(), windowsHide: true, windowsVerbatimArguments: true,

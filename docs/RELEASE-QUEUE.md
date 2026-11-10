@@ -17,6 +17,41 @@
 > **2026-11-03 04:05：v0.8.7 已发布**，覆盖本表截至该时间的全部待发布批次（0.8.6 以来全部 dev，74 commits）。
 > 以下批次保留作追溯；后续新批次继续加在最上面。
 
+### 批次 2026-11-11 03:40 · SnowLuma 一键启动（弹框 / Electron 当 node / 黑框）
+
+<!-- release-batch: start=2026-11-11T02:45+08:00 end=2026-11-11T03:40+08:00 commits=1aa0d8f,f58e089 -->
+
+**覆盖提交**：已合入 `dev`，覆盖至 `f58e089`（含 `1aa0d8f`、`82864b0`、`3926076`、`589fb04`）
+**建议**：并入下一个 patch（用户可见修复）
+
+**改了什么**：
+- `plugins/surfcore/lib/index.js`
+  - 新增 `resolveSnowLumaNode()`：`snowluma.nodePath` → SnowLuma 自带 `node.exe` → 宿主本身是 node 时用 execPath → 空（回落 launcher.bat）。
+  - `spawnSnowLumaDetached()` 的 VBS 改由 **`wscript.exe`** 执行（原来用 `explorer.exe`，会弹「你要打开此文件吗」）。
+  - legacy + 隐藏黑框分支改走同一套 VBS（不再直接 `spawn(node, {windowsHide})`）。
+  - `nodePathEnv()`：只有 `execPath` 真是 node 才把它的目录塞进 PATH。
+- `scripts/test-launch-components.mjs`：新增 7 条静态断言，钉住「不许用 execPath 当 node」「不许用 explorer 开 VBS」「必须走 wscript」。
+
+**为什么**：四个独立根因互相遮挡 —— ① `D:\SnowLuma` 82 个文件带 MOTW；② VBS 经 explorer 打开被系统确认框拦住；③ DSH 宿主是 Electron，`process.execPath` 不是 node；④ 用 `windowsHide` 造出的「无控制台」父进程，其子进程会被分配可见的新控制台（黑框）。
+
+**验证**：
+- 真机：`13264` 窗口=0，其子 `884` 窗口=0（修前子进程窗口=1508824）；3000/3001/3100 全在听。
+- 对照实验：`wscript` + style 0 起的父进程，其子进程窗口=0；`windowsHide` 起的父进程，其子进程窗口≠0。
+- `test-launch-components` / `test-snowluma-install` / `test-platform-start-host` / `test-host-smoke` 全过。
+
+**case**：[`cases/2026-11-11-snowluma-launch.md`](cases/2026-11-11-snowluma-launch.md)
+
+**交接块（可直接转发给发布会话）**：
+
+```
+批次：2026-11-11 03:40 · SnowLuma 一键启动修复
+覆盖：dev @ f58e089（含 1aa0d8f / 82864b0 / 3926076 / 589fb04）
+文件：plugins/surfcore/lib/index.js、scripts/test-launch-components.mjs、docs/cases/2026-11-11-snowluma-launch.md
+验证：真机无弹框无黑框；4 个插件测试 + 静态断言全过
+建议：patch 版本
+注意：不涉及配置/schema 变更；用户侧无需迁移
+```
+
 ### 批次 2026-11-11 01:45 · QQ 承诺定时（模糊：晚点/稍后）
 
 <!-- release-batch: start=2026-11-11T01:20+08:00 end=2026-11-11T01:45+08:00 commits=feat/promise-noshow -->
