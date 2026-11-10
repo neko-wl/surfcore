@@ -111,7 +111,13 @@ await test('幂等：同一拍连跑两次只投一次', async () => {
 });
 
 await test('错过补发窗口：不唤醒，但记 missed 标记（失败可见）', async () => {
-  const h = await bridgeHarness({ config: itemConfig(hhmm(-90), { graceMs: 30 * 60 * 1000 }) });
+  // 不能直接用「现在 -90 分钟」：跨过午夜时会落到昨天，同一天的判定自然看不到它。
+  // 改成「今天凌晨到现在的某个已过时刻」，再把补发窗口压到 1 分钟。
+  const now = new Date();
+  const minutesToday = now.getHours() * 60 + now.getMinutes();
+  const past = Math.max(0, minutesToday - 90);
+  const pastTime = `${pad(Math.floor(past / 60))}:${pad(past % 60)}`;
+  const h = await bridgeHarness({ config: itemConfig(pastTime, { graceMs: 60 * 1000 }) });
   try {
     h.setMode('reserved2');
     const st = h.getSocialV2State(KEY);
@@ -119,7 +125,7 @@ await test('错过补发窗口：不唤醒，但记 missed 标记（失败可见
     h.runScheduledProactiveTick();
     await new Promise((r) => setTimeout(r, 120));
     assert.equal(h.calls.created.length, before, '超窗口不得补发');
-    assert.equal(st.scheduledProactiveFired['night-check'], `missed:${scheduledDayKey(Date.now())}`, '必须留下 missed 记录，不能当作没发生');
+    assert.equal(st.scheduledProactiveFired?.['night-check'], `missed:${scheduledDayKey(Date.now())}`, '必须留下 missed 记录，不能当作没发生');
   } finally { h.dispose?.(); }
 });
 

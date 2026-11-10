@@ -1,0 +1,125 @@
+﻿// 「她说几点来」→ 一个可执行的时刻。
+//
+// 为什么要单独成文件：中文时间表达（十一点半 / 晚上11:30 / 今晚十点）解析是这个功能里
+// 唯一没法靠日志事后核对的部分 —— 解析错了就会在完全不相干的时刻冒出来。所以把它做成
+// 纯函数，用固定文本钉死每一个能想到的写法，而不是塞进 bridge 里靠肉眼验。
+//
+// 设计原则：**宁可漏，不可错**。漏一次只是这次没按约来（还有工具登记兜底）；
+// 猜错一次就是凌晨三点突然弹一句「我来啦」。
+
+const CN_DIGITS = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+
+/** 「十一」「二十」→ 数字；只用于 1~59 这种小范围。 */
+export function parseChineseNumber(input) {
+  const s = String(input ?? '').trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return Number(s);
+  if (/^十[一二三四五六七八九]?$/.test(s)) return 10 + (s.length > 1 ? CN_DIGITS[s[1]] : 0);
+  if (/^[一二两三四五六七八九]十[一二三四五六七八九]?$/.test(s)) return CN_DIGITS[s[0]] * 10 + (s.length > 2 ? CN_DIGITS[s[2]] : 0);
+  if (/^[一二两三四五六七八九]$/.test(s)) return CN_DIGITS[s];
+  return null;
+}
+
+// 出现这些词才有「约」的意思，否则「我十点就睡了」也会被当成承诺。
+const CUE_RE = /(约好|说好|答应|来找你|去找你|来找我|跟你聊|喊你|叫你|查岗|催你|等你|提醒你|见你|跟你见|发消息给你|跟你说话)/;
+
+// 明显的过去/习惯叙述，一律不登记。
+const PAST_RE = /(昨天|昨晚|前天|刚才|已经|早就|上个|上一次|平时|每天|以前)/;
+
+// 时段修饰：晚上/今晚默认按当下这一天；明天/明晚 +1 天。
+const NEXT_DAY_RE = /(明天|明晚|明儿|次日)/;
+const EVENING_RE = /(晚上|今晚|夜里|夜间|傍晚|下午|中午|早上|早晨|上午)/;
+
+// 「晚一点」「快一点」「少一点」里的「一点」不是钟点。紧跟在这些字后面的点，一律不认。
+const ADVERB_BEFORE_RE = /[晚早快慢多少再差好]/;
+// 「一点」单独出现时最容易误判，只有前面没有上述副词时才当钟点。
+
+/**
+ * 从一句话里认出「几点」。
+ * 返回 { hour, minute } 或 null；不负责判断今天还是明天。
+ */
+export function parseClockTime(text) {
+  const s = String(text ?? '');
+  const clock = /(\d{1,2})\s*[:：]\s*(\d{2})/.exec(s);
+  if (clock) {
+    const hour = Number(clock[1]);
+    const minute = Number(clock[2]);
+    if (hour <= 23 && minute <= 59) return { hour, minute };
+  }
+  const re = /([零一二两三四五六七八九十]{1,3}|\d{1,2})\s*点\s*(半|[零一二两三四五六七八九十]{1,3}|\d{1,2})?/g;
+  let m;
+  while ((m = re.exec(s))) {
+    // 只有「一点」会被副词吃掉（晚一点/快一点/少一点）；「十一点」里的「一点」不算，
+    // 否则「今晚十一点半」会被前一个字「晚」误杀。
+    if (m[1] === '一' && ADVERB_BEFORE_RE.test(s[m.index - 1] ?? '')) continue;
+    const hour = parseChineseNumber(m[1]);
+    const tail = String(m[2] ?? '').trim();
+    let minute = 0;
+    if (tail === '半') minute = 30;
+    else if (tail) minute = parseChineseNumber(tail) ?? -1;
+    if (!Number.isFinite(hour) || hour > 23) continue;
+    if (!Number.isFinite(minute) || minute < 0 || minute > 59) continue;
+    return { hour, minute };
+  }
+  return null;
+}
+
+/**
+ * 从她发出的一句话里认出「承诺了一个时刻」。
+ * now 传进来的同一天算当天；明天/明晚 +1 天；已经过去的时刻返回 null（不自己猜明天）。
+ *
+ * 返回 { forAt, hour, minute, raw } 或 null。
+ */
+export function detectPromise(text, now) {
+  const s = String(text ?? '').trim();
+  if (!s || s.length > 400) return null;
+  if (!CUE_RE.test(s)) return null;
+  if (PAST_RE.test(s)) return null;
+  const parsed = parseClockTime(s);
+  if (!parsed) return null;
+
+  let { hour, minute } = parsed;
+  const evening = EVENING_RE.test(s);
+  let nextDay = NEXT_DAY_RE.test(s);
+  // 12 小时制补成 24 小时制，但要分清真·晚上和真·凌晨：
+  //   晚上八点(8) → 20:00；晚上十二点(12) → 次日 00:00；晚上一点(1) → 次日 01:00。
+  if (evening) {
+    if (hour === 12) { hour = 0; nextDay = true; }
+    else if (hour >= 1 && hour <= 3) { nextDay = true; }
+    else if (hour < 12) { hour += 12; }
+  }
+  if (hour >= 24) hour -= 24;
+
+  const base = new Date(now);
+  if (nextDay) base.setDate(base.getDate() + 1);
+  base.setHours(hour, minute, 0, 0);
+
+  const forAt = base.getTime();
+  // 过后才说的（"我 11 点半就睡了"已被 PAST_RE 挡掉，这里挡的是「时间点已过」）。
+  if (forAt <= now + 60 * 1000) return null;
+  // 太远的不管（扫描路径只处理当天的口头约定，跨天由工具显式登记）。
+  if (forAt - now > 24 * 60 * 60 * 1000) return null;
+
+  return { forAt, hour, minute, raw: s.slice(0, 200) };
+}
+
+/**
+ * 在 [forAt - leadMs, forAt] 里随机取一个触发点。
+ * 取的是「提前一段时间」，不是「准点」，这样她的出现不会像闹钟。
+ */
+export function computePromiseFireAt(forAt, leadMs, rand = Math.random) {
+  const windowMs = Math.max(0, Number(leadMs) || 0);
+  const start = Number(forAt) - windowMs;
+  const r = Math.min(0.999999, Math.max(0, Number(rand()) || 0));
+  return start + Math.floor(r * windowMs);
+}
+
+/** 'HH:MM'（给工具登记用；跨天由 forAt 自己表达）。 */
+export function parseHHMM(input) {
+  const m = /^(\d{1,2})[:：](\d{1,2})$/.exec(String(input ?? '').trim());
+  if (!m) return null;
+  const hour = Number(m[1]);
+  const minute = Number(m[2]);
+  if (hour > 23 || minute > 59) return null;
+  return { hour, minute };
+}
