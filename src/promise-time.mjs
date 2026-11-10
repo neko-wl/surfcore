@@ -1,4 +1,4 @@
-﻿// 「她说几点来」→ 一个可执行的时刻。
+// 「她说几点来」→ 一个可执行的时刻。
 //
 // 为什么要单独成文件：中文时间表达（十一点半 / 晚上11:30 / 今晚十点）解析是这个功能里
 // 唯一没法靠日志事后核对的部分 —— 解析错了就会在完全不相干的时刻冒出来。所以把它做成
@@ -22,6 +22,10 @@ export function parseChineseNumber(input) {
 
 // 出现这些词才有「约」的意思，否则「我十点就睡了」也会被当成承诺。
 const CUE_RE = /(约好|说好|答应|来找你|去找你|来找我|跟你聊|喊你|叫你|查岗|催你|等你|提醒你|见你|跟你见|发消息给你|跟你说话)/;
+
+// 入站方向（**对方**答应来找她）：「我 11 点半来找你」「等我 11 点半」「我这就过来」。
+// 必须带第一人称 + 明确的「过去」动作 —— 否则「我去睡了」这种也会中招。
+const INCOMING_CUE_RE = /((我|咱)[^。！？\n]{0,12}(来找你|来见你|过来|到你那|到你家|准时到|我到了|见你|等你)|等我|我(马上|这就|立刻|准时就))/;
 
 // 明显的过去/习惯叙述，一律不登记。
 const PAST_RE = /(昨天|昨晚|前天|刚才|已经|早就|上个|上一次|平时|每天|以前)/;
@@ -64,23 +68,11 @@ export function parseClockTime(text) {
   return null;
 }
 
-/**
- * 从她发出的一句话里认出「承诺了一个时刻」。
- * now 传进来的同一天算当天；明天/明晚 +1 天；已经过去的时刻返回 null（不自己猜明天）。
- *
- * 返回 { forAt, hour, minute, raw } 或 null。
- */
-export function detectPromise(text, now) {
-  const s = String(text ?? '').trim();
-  if (!s || s.length > 400) return null;
-  if (!CUE_RE.test(s)) return null;
-  if (PAST_RE.test(s)) return null;
-  const parsed = parseClockTime(s);
-  if (!parsed) return null;
-
+/** 把「几点」落到一个具体的未来时刻上。两个方向共用，避免 12/24 小时制的转换写两遍。 */
+function resolveForAt(text, parsed, now) {
   let { hour, minute } = parsed;
-  const evening = EVENING_RE.test(s);
-  let nextDay = NEXT_DAY_RE.test(s);
+  const evening = EVENING_RE.test(text);
+  let nextDay = NEXT_DAY_RE.test(text);
   // 12 小时制补成 24 小时制，但要分清真·晚上和真·凌晨：
   //   晚上八点(8) → 20:00；晚上十二点(12) → 次日 00:00；晚上一点(1) → 次日 01:00。
   if (evening) {
@@ -99,8 +91,40 @@ export function detectPromise(text, now) {
   if (forAt <= now + 60 * 1000) return null;
   // 太远的不管（扫描路径只处理当天的口头约定，跨天由工具显式登记）。
   if (forAt - now > 24 * 60 * 60 * 1000) return null;
+  return { forAt, hour, minute };
+}
 
-  return { forAt, hour, minute, raw: s.slice(0, 200) };
+/**
+ * 从**她**发出的一句话里认出「她承诺了一个时刻」（direction='out'：她要去赴约）。
+ * now 传进来的同一天算当天；明天/明晚 +1 天；已经过去的时刻返回 null（不自己猜明天）。
+ */
+export function detectPromise(text, now) {
+  const s = String(text ?? '').trim();
+  if (!s || s.length > 400) return null;
+  if (!CUE_RE.test(s)) return null;
+  if (PAST_RE.test(s)) return null;
+  const parsed = parseClockTime(s);
+  if (!parsed) return null;
+  const resolved = resolveForAt(s, parsed, now);
+  if (!resolved) return null;
+  return { ...resolved, direction: 'out', raw: s.slice(0, 200) };
+}
+
+/**
+ * 从**对方**发来的一句话里认出「他要来找她」（direction='in'：她等他，等不到就追问）。
+ * 和 outgoing 的判定刻意分开：这里要的是第一人称 + 「过去」的动词，
+ * 否则「我去睡了」这种也会中招。
+ */
+export function detectIncomingPromise(text, now) {
+  const s = String(text ?? '').trim();
+  if (!s || s.length > 400) return null;
+  if (!INCOMING_CUE_RE.test(s)) return null;
+  if (PAST_RE.test(s)) return null;
+  const parsed = parseClockTime(s);
+  if (!parsed) return null;
+  const resolved = resolveForAt(s, parsed, now);
+  if (!resolved) return null;
+  return { ...resolved, direction: 'in', raw: s.slice(0, 200) };
 }
 
 /**
@@ -112,6 +136,18 @@ export function computePromiseFireAt(forAt, leadMs, rand = Math.random) {
   const start = Number(forAt) - windowMs;
   const r = Math.min(0.999999, Math.max(0, Number(rand()) || 0));
   return start + Math.floor(r * windowMs);
+}
+
+/**
+ * 等不到人时的追问时刻：在 [forAt + missMs, forAt + missMs + askWindowMs] 里随机。
+ * 例如约定 23:30、missMs=10min、askWindowMs=10min → 落在 23:40~23:50。
+ */
+export function computeAskFireAt(forAt, missMs, askWindowMs, rand = Math.random) {
+  const miss = Math.max(0, Number(missMs) || 0);
+  const win = Math.max(0, Number(askWindowMs) || 0);
+  const start = Number(forAt) + miss;
+  const r = Math.min(0.999999, Math.max(0, Number(rand()) || 0));
+  return start + Math.floor(r * win);
 }
 
 /** 'HH:MM'（给工具登记用；跨天由 forAt 自己表达）。 */

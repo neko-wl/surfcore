@@ -4,7 +4,7 @@
 // 所以这里把中文时间表达逐个钉死，再验调度/去重/错过/取消。
 import assert from 'node:assert/strict';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
-import { computePromiseFireAt, detectPromise, parseChineseNumber, parseClockTime, parseHHMM } from '../src/promise-time.mjs';
+import { computeAskFireAt, computePromiseFireAt, detectIncomingPromise, detectPromise, parseChineseNumber, parseClockTime, parseHHMM } from '../src/promise-time.mjs';
 
 let failures = 0;
 async function test(name, run) {
@@ -182,6 +182,89 @@ await test('出站扫描：她自己说了就算数（工具没调也能兜住�
     // 不是承诺的话不登记
     h.notePromiseFromOutbound(KEY, ['我今天十点就睡了']);
     assert.equal(h.promisesOf(st).filter((p) => p.status === 'pending').length, 1);
+  } finally { h.dispose?.(); }
+});
+
+// ── 反向：对方答应来找她（等不到人 → 追问） ───────────────────────────────
+await test('detectIncomingPromise：认得出「我今晚十一点半来找你」', () => {
+  const now = at(0, 22, 0);
+  const hit = detectIncomingPromise('我今晚十一点半来找你', now);
+  assert.ok(hit, '应当认出对方的约定');
+  assert.equal(hit.direction, 'in');
+  assert.equal(new Date(hit.forAt).getHours(), 23);
+  assert.equal(new Date(hit.forAt).getMinutes(), 30);
+});
+
+await test('detectIncomingPromise：没有第一人称/没有「过去」的动作，都不登记', () => {
+  const now = at(0, 22, 0);
+  assert.equal(detectIncomingPromise('今晚十一点半', now), null, '没说谁来');
+  assert.equal(detectIncomingPromise('我十点就睡了', now), null, '不是来赴约');
+  assert.equal(detectIncomingPromise('我去睡了，晚安', now), null, '只是去睡觉');
+  assert.equal(detectIncomingPromise('昨天我十一点半来找你', now), null, '过去的事');
+});
+
+await test('computeAskFireAt：落在 [约定+等多久, 约定+等多久+追问窗口]', () => {
+  const forAt = 1_700_000_000_000;
+  const miss = 10 * 60 * 1000;
+  const win = 10 * 60 * 1000;
+  assert.equal(computeAskFireAt(forAt, miss, win, () => 0), forAt + miss, 'rand=0 → 窗口起点');
+  const high = computeAskFireAt(forAt, miss, win, () => 0.999999);
+  assert.ok(high > forAt + miss, '不能早于「算他爽约」的时刻');
+  assert.ok(high < forAt + miss + win, '不能越过追问窗口终点');
+});
+
+await test('等不到人：到点后没人说话 → 追问一次（noshow）', async () => {
+  const h = await bridgeHarness({ config: { socialV2: { enabled: true } } });
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State(KEY);
+    const res = h.registerPromiseV2(KEY, { forAt: Date.now() + 5 * 60_000, source: 'tool', direction: 'in' });
+    assert.equal(res.promise.direction, 'in');
+    assert.equal(res.promise.fireAt, undefined, '反向的没有「提前赴约」触发点');
+    assert.ok(res.promise.askAt, '反向的要有追问时刻');
+    // 造出「约定已过、追问时刻已到、期间没人说话」
+    res.promise.forAt = Date.now() - 5 * 60_000;
+    res.promise.askAt = Date.now() - 1;
+    st.lastIncomingAt = Date.now() - 60 * 60_000;
+    const before = h.calls.created.length;
+    h.runPromiseTick();
+    const started = Date.now();
+    while (h.calls.created.length === before && Date.now() - started < 2000) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(h.calls.created.length > before, '等不到人必须叫醒她去问');
+    assert.equal(h.getSocialV2State(KEY).lastWakeReason, `noshow:${res.promise.id}`);
+  } finally { h.dispose?.(); }
+});
+
+await test('人来了：约定之后有过入站消息 → 不追问', async () => {
+  const h = await bridgeHarness({ config: { socialV2: { enabled: true } } });
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State(KEY);
+    const res = h.registerPromiseV2(KEY, { forAt: Date.now() + 5 * 60_000, source: 'tool', direction: 'in' });
+    res.promise.forAt = Date.now() - 5 * 60_000;
+    res.promise.askAt = Date.now() - 1;
+    // 约定之后他说过话
+    st.lastIncomingAt = Date.now();
+    const before = h.calls.created.length;
+    h.runPromiseTick();
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(h.calls.created.length, before, '人来了就不该再问');
+    assert.equal(res.promise.status, 'kept', '要记为「如约出现」而不是静默');
+  } finally { h.dispose?.(); }
+});
+
+await test('入站扫描：他自己说了「我 11 点半来找你」就登记', async () => {
+  const h = await bridgeHarness({ config: { socialV2: { enabled: true } } });
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State(KEY);
+    h.notePromiseFromIncoming(KEY, { text: '我今晚十一点半来找你', plain: '我今晚十一点半来找你', isSelf: false, isOwner: true, time: Date.now() });
+    const list = h.promisesOf(st);
+    assert.equal(list.length, 1);
+    assert.equal(list[0].direction, 'in', '方向必须标成对方来');
+    // 她自己的发言走另一个入口，不该被这个钩子重复登记
+    h.notePromiseFromIncoming(KEY, { text: '我今晚十一点半来找你', plain: '我今晚十一点半来找你', isSelf: true, time: Date.now() });
+    assert.equal(h.promisesOf(st).length, 1);
   } finally { h.dispose?.(); }
 });
 

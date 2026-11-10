@@ -351,7 +351,10 @@
       "leadMs": 600000,
       "graceMs": 1800000,
       "scanEnabled": true,
-      "maxPending": 5
+      "maxPending": 5,
+      "missMs": 600000,
+      "askWindowMs": 600000,
+      "noshowGraceMs": 7200000
     },
     "feedback": {
       "maxLength": 500,
